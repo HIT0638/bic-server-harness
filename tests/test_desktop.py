@@ -48,12 +48,20 @@ class FakeWindow:
         self.events = SimpleNamespace(closing=FakeEvent())
         self.dirty = False
         self.confirmed = True
+        self.run_js_called = threading.Event()
+        self.confirm_called = threading.Event()
+        self.destroyed = threading.Event()
 
     def run_js(self, _script):
+        self.run_js_called.set()
         return self.dirty
 
     def create_confirmation_dialog(self, _title, _message):
+        self.confirm_called.set()
         return self.confirmed
+
+    def destroy(self):
+        self.destroyed.set()
 
 
 class FakeWebView:
@@ -187,17 +195,58 @@ class TestDesktopLifecycle(unittest.TestCase):
 
     def test_dirty_close_confirmation(self):
         window = FakeWindow()
-        self.assertTrue(desktop._confirm_close(window))
+        self.assertFalse(desktop._confirm_close(window))
+        self.assertTrue(window.destroyed.wait(timeout=1))
+
+        window = FakeWindow()
         window.dirty = True
         window.confirmed = False
         self.assertFalse(desktop._confirm_close(window))
+        self.assertTrue(window.confirm_called.wait(timeout=1))
+        self.assertFalse(window.destroyed.wait(timeout=0.05))
+
+        window = FakeWindow()
+        window.dirty = True
         window.confirmed = True
-        self.assertTrue(desktop._confirm_close(window))
+        self.assertFalse(desktop._confirm_close(window))
+        self.assertTrue(window.confirm_called.wait(timeout=1))
+        self.assertTrue(window.destroyed.wait(timeout=1))
 
     def test_dirty_probe_failure_allows_close(self):
         window = FakeWindow()
         window.run_js = mock.Mock(side_effect=RuntimeError("not loaded"))
-        self.assertTrue(desktop._confirm_close(window))
+        self.assertFalse(desktop._confirm_close(window))
+        self.assertTrue(window.destroyed.wait(timeout=1))
+
+    def test_close_handler_does_not_wait_for_main_thread_javascript(self):
+        window = FakeWindow()
+        callback_returned = threading.Event()
+
+        def wait_for_callback(_script):
+            window.run_js_called.set()
+            callback_returned.wait(timeout=1)
+            return False
+
+        window.run_js = wait_for_callback
+        result = []
+
+        def invoke_handler():
+            result.append(desktop._confirm_close(window))
+            callback_returned.set()
+
+        thread = threading.Thread(target=invoke_handler)
+        thread.start()
+        try:
+            self.assertTrue(window.run_js_called.wait(timeout=0.2))
+            thread.join(timeout=0.2)
+            self.assertFalse(
+                thread.is_alive(),
+                "closing callback blocked waiting for main-thread JavaScript")
+            self.assertEqual(result, [False])
+            self.assertTrue(window.destroyed.wait(timeout=1))
+        finally:
+            callback_returned.set()
+            thread.join(timeout=1)
 
     def test_startup_error_html_is_escaped(self):
         content = desktop._startup_error_html(

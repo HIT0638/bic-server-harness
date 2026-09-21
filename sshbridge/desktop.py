@@ -117,16 +117,64 @@ def _load_webview():
 
 
 def _confirm_close(window):
-    try:
-        dirty = bool(window.run_js(
-            "document.documentElement.dataset.dirty === 'true'"))
-    except Exception:
-        return True
-    if not dirty:
-        return True
-    return bool(window.create_confirmation_dialog(
-        "Unsaved changes",
-        "The current file has unsaved changes. Close the window anyway?"))
+    controller = getattr(window, "_sshbridge_close_controller", None)
+    if controller is None:
+        controller = _CloseController()
+        window._sshbridge_close_controller = controller
+    return controller.request_close(window)
+
+
+class _CloseController:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._checking = False
+        self._allow_close = False
+
+    def request_close(self, window):
+        with self._lock:
+            if self._allow_close:
+                return True
+            if self._checking:
+                return False
+            self._checking = True
+        # Cocoa runs the closing event on its main thread. JS evaluation must
+        # run elsewhere because pywebview schedules WebKit work back to it.
+        thread = threading.Thread(
+            target=self._resolve_close,
+            args=(window,),
+            name="sshbridge-desktop-close",
+            daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            with self._lock:
+                self._checking = False
+            return True
+        return False
+
+    def _resolve_close(self, window):
+        should_close = True
+        try:
+            dirty = bool(window.run_js(
+                "document.documentElement.dataset.dirty === 'true'"))
+            if dirty:
+                should_close = bool(window.create_confirmation_dialog(
+                    "Unsaved changes",
+                    "The current file has unsaved changes. "
+                    "Close the window anyway?"))
+        except Exception:
+            should_close = True
+
+        with self._lock:
+            self._checking = False
+            self._allow_close = should_close
+        if not should_close:
+            return
+        try:
+            window.destroy()
+        except Exception:
+            with self._lock:
+                self._allow_close = False
 
 
 def _close_server(server, thread):

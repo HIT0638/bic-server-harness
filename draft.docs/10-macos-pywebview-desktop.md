@@ -48,8 +48,10 @@ webview_module.start(private_mode=True)
 
 GUI loop 正常退出或异常时都会执行 `shutdown`、`server_close` 和最长 5 秒的线程
 join。Desktop 不调用 Broker stop。未保存状态由前端同步到
-`document.documentElement.dataset.dirty`，关闭事件通过 pywebview `run_js` 读取；
-该 API 不依赖 `eval`，因此无需放宽现有 CSP。
+`document.documentElement.dataset.dirty`。Cocoa 的同步关闭回调先取消本次关闭，
+再由后台线程通过 pywebview `run_js` 读取状态、按需显示确认框并销毁窗口，避免
+主线程等待自身调度的 WebKit JavaScript。该 API 不依赖 `eval`，因此无需放宽现有
+CSP。
 
 `sshbridge/web.py` 继续提供随机 loopback 端口、随机 token、CSP 和
 Broker-backed `WorkspaceService`。浏览器入口与 Desktop 共用 `explorer_url`：
@@ -353,7 +355,7 @@ pywebview window API 增加，不改变 Broker 协议。
 
 ### 实际验证结果
 
-- Apple Python `3.9.6` 与 Homebrew Python `3.12.14` 均通过完整 84 项测试。
+- Apple Python `3.9.6` 与 Homebrew Python `3.12.14` 均通过完整 85 项测试。
 - `python3 -m compileall`、`node --check sshbridge/web_assets/app.js` 与
   `git diff --check` 通过。
 - 开发入口已启动真实 Cocoa 窗口；页面完成加载，未保存标记在编辑后由 `false`
