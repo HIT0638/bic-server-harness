@@ -7,6 +7,32 @@
 
 Web Explorer 已使用随机 token，但 daemon 协议没有调用者认证。
 
+## 当前实现
+
+`sshbridge/daemon.py::serve` 创建普通 TCP socket，并绑定调用参数指定的地址和端口：
+
+```python
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind((host, port))
+srv.listen(16)
+```
+
+`sshbridge/daemon.py::_client` 直接解析 JSON 并按 `op` 执行，没有 token、UID 或
+peer credential 校验：
+
+```python
+req = json.loads(raw.decode("utf-8"))
+op = req.get("op")
+if op == "shutdown":
+    _send(conn, {"ok": True, "result": {"bye": True}})
+    _SHUTDOWN.set()
+    return
+result = _run_op(profile, state, op, req.get("args", {}))
+```
+
+默认调用路径固定使用 `127.0.0.1`，因此当前风险主要来自同一台机器上的其他进程。
+
 ## 痛点
 
 - 任意本机进程都可以尝试连接 daemon 端口。

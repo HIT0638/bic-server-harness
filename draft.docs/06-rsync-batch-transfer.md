@@ -8,6 +8,20 @@ SFTP 适合目录浏览、小文件读写和编辑器保存。大文件或大量
 Rsync 能进行增量、批量和断点友好的文件传输，并可复用系统 OpenSSH。远端是否安装
 rsync 不属于当前基础假设，因此该能力只能是可选增强。
 
+## 当前实现
+
+当前没有 Rsync 传输通道。大文件仍通过 `sshbridge/ops.py` 中的 SFTP 分块循环传输：
+
+```python
+CHUNK = 32768
+
+for off in range(0, len(data), CHUNK):
+    s.write_chunk(handle, off, data[off:off + CHUNK])
+```
+
+读取也在同一 SFTP session 中按 chunk 顺序完成。Web 和 daemon 都会串行化各自
+session 上的操作。当前没有批量同步 API、能力探测或传输任务状态。
+
 ## 痛点
 
 - 单个大文件会延迟同一 SFTP 会话上的目录查询。

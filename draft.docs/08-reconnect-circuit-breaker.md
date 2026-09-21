@@ -8,6 +8,43 @@ daemon 在共享 SFTP 会话失效后还会再创建新会话，并在部分失�
 正式服务器会根据短时间连接或认证失败次数封禁来源 IP，因此常见的自动重试策略可能
 放大故障。
 
+## 当前实现
+
+`sshbridge/sftp_client.py::SftpSession` 默认重试两次，因此一次创建最多启动三个
+OpenSSH 子进程：
+
+```python
+def __init__(self, argv, op_timeout=60,
+             connect_retries=2, retry_delay=3.0):
+    for attempt in range(connect_retries + 1):
+        self._spawn(argv)
+        try:
+            self.version = self._handshake()
+            return
+        except BridgeError as e:
+            self._hard_shutdown()
+            if not _is_connect_failure(e) or attempt == connect_retries:
+                raise
+            time.sleep(retry_delay * (attempt + 1))
+```
+
+`sshbridge/exec_client.py::run_exec` 对返回码 255 且命中连接错误标记的请求采用相同的
+默认重试次数：
+
+```python
+attempts = connect_retries + 1
+for attempt in range(attempts):
+    cp = subprocess.run(argv, capture_output=True, timeout=timeout)
+    if cp.returncode == 255 and _is_pre_auth_failure(cp.stderr) \
+            and attempt < attempts - 1:
+        time.sleep(retry_delay * (attempt + 1))
+        continue
+    break
+```
+
+daemon 在 SFTP 建连失败后设置 60 秒起步、最长 1800 秒的冷却，但该状态只存在于
+daemon 进程内。Web、直接 CLI 和其他进程不共享该冷却。
+
 ## 痛点
 
 - 多个进程可以同时重试，单进程退避无法限制全局频率。

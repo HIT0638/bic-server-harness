@@ -7,6 +7,26 @@ CLI 和 Web Explorer 已经通过 `sshbridge/ops.py` 提供统一的远程文件
 
 MCP Server 运行在本地。远端服务器不安装 MCP 组件，也不运行 Agent Runtime。
 
+## 当前实现
+
+当前没有 MCP Server。已经存在可复用的操作层，函数接收 `Profile` 和普通参数，
+返回 JSON-ready 字典。例如 `sshbridge/ops.py::op_list_dir`：
+
+```python
+def op_list_dir(profile, path="/", session=None):
+    with _maybe_session(profile, session) as s:
+        croot = _canon_root(s, profile)
+        canon = s.realpath(resolve_virtual(path, profile.root))
+        ensure_within_root(canon, croot)
+        _require_dir(s, canon, "list_dir target")
+        raw = s.list_dir(canon)
+    entries = [_entry(n, a) for n, a in sorted(raw, key=lambda e: e[0])]
+    return {"op": "list_dir", "path": path,
+            "real_path": canon, "entries": entries}
+```
+
+CLI 和 daemon 已调用该层。MCP 适配器尚不存在，不附 MCP 协议实现代码。
+
 ## 痛点
 
 - Agent 当前只能通过 shell 拼接 CLI 命令。

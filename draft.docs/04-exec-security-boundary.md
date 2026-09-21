@@ -12,6 +12,27 @@ cd <workspace-cwd> && <command>
 文件 API 使用 SFTP `REALPATH` 校验路径，但任意 shell 命令无法通过本地路径解析获得
 同等级别的隔离。
 
+## 当前实现
+
+`sshbridge/ops.py::op_exec` 只对 `cwd` 执行虚拟路径映射，然后把原始命令交给
+OpenSSH：
+
+```python
+command = (command or "").strip()
+cwd_real = resolve_virtual(cwd, profile.root)
+res = run_exec(profile, command, cwd_real, timeout)
+```
+
+`sshbridge/exec_client.py::run_exec` 生成的远端命令如下：
+
+```python
+remote = "cd %s && %s" % (shlex.quote(cwd), command)
+argv = profile.exec_argv(remote)
+cp = subprocess.run(argv, capture_output=True, timeout=timeout)
+```
+
+`cd` 只设置起始目录。`command` 仍可使用绝对路径、再次切换目录或调用任何远端程序。
+
 ## 痛点
 
 - 命令可使用绝对路径访问工作区以外文件。

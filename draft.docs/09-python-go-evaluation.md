@@ -7,6 +7,31 @@
 
 随着 Connection Broker、MCP、Rsync 和长期任务加入，需要评估是否改用 Go。
 
+## 当前实现
+
+当前项目使用 Python 标准库。`sshbridge/config.py::Profile` 只负责生成系统 OpenSSH
+参数，不实现 SSH 认证协议：
+
+```python
+def sftp_argv(self):
+    return self.ssh_argv() + ["-s", "--", self.host, "sftp"]
+
+def exec_argv(self, remote_command):
+    return self.ssh_argv() + ["--", self.host, remote_command]
+```
+
+SFTP 客户端通过 `subprocess.Popen` 启动系统 ssh：
+
+```python
+self.proc = subprocess.Popen(
+    argv,
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE)
+```
+
+命令执行同样通过系统 ssh。当前没有 Go 实现、Go 构建链或跨语言 IPC 契约。
+
 ## 痛点
 
 - Python 应用分发依赖本机 Python 版本。

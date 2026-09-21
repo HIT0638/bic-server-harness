@@ -9,6 +9,36 @@
 SSH 协议允许一个 TCP transport 同时承载多个 session channel。OpenSSH
 ControlMaster 可以让多个本地 `ssh` 子进程共享同一 TCP。
 
+## 当前实现
+
+`sshbridge/exec_client.py::run_exec` 同步等待一个 OpenSSH 子进程结束，并将输出全部
+保存在内存：
+
+```python
+cp = subprocess.run(argv, capture_output=True, timeout=timeout)
+return {
+    "exit_code": cp.returncode,
+    "stdout": _decode(cp.stdout),
+    "stderr": _decode(cp.stderr),
+    "timed_out": False,
+}
+```
+
+超时时只终止本地 ssh 进程：
+
+```python
+except subprocess.TimeoutExpired as e:
+    return {
+        "exit_code": None,
+        "stdout": _decode(e.stdout),
+        "stderr": _decode(e.stderr),
+        "timed_out": True,
+    }
+```
+
+`sshbridge/daemon.py::_run_op` 在全局 `state["lock"]` 内调用 `_dispatch`。由于
+`_dispatch` 也处理 `exec`，长命令会占用同一把锁并阻塞 daemon 的文件请求。
+
 ## 痛点
 
 - 长命令占用 daemon 全局锁。

@@ -8,6 +8,40 @@
 OpenSSH 提供 `posix-rename@openssh.com` 扩展，可原子覆盖已有目标。标准 SFTP v3
 rename 通常拒绝覆盖，因此当前回退逻辑会先删除目标，再重命名临时文件。
 
+## 当前实现
+
+`sshbridge/ops.py::op_write_file` 在目标目录写临时文件，再调用 rename：
+
+```python
+tmp = join(parent, ".sshbridge.tmp." + uuid.uuid4().hex[:12])
+handle = s.open_handle(
+    tmp, P.FXF_WRITE | P.FXF_CREAT | P.FXF_TRUNC)
+for off in range(0, len(data), CHUNK):
+    s.write_chunk(handle, off, data[off:off + CHUNK])
+s.close_handle(handle)
+s.rename(tmp, target)
+```
+
+`sshbridge/sftp_client.py::rename` 优先调用 OpenSSH 扩展：
+
+```python
+t, body = self._request(
+    P.FXP_EXTENDED,
+    P.pstr("posix-rename@openssh.com") + P.pstr(src) + P.pstr(dst))
+if code == P.FX_OK:
+    return
+if code == P.FX_OP_UNSUPPORTED:
+    return self._rename_v3(src, dst)
+```
+
+当前 SFTP v3 回退会删除旧目标后重试：
+
+```python
+self.remove(dst)
+t, body = self._request(P.FXP_RENAME, P.pstr(src) + P.pstr(dst))
+self._status(t, body, "rename")
+```
+
 ## 痛点
 
 - 删除与重命名之间断线，会留下目标文件缺失状态。

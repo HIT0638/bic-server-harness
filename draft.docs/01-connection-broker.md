@@ -9,6 +9,34 @@ OpenSSH 进程。
 SSH TCP 连接与 SSH channel 是不同资源。一个持久 SSH TCP 可以承载 SFTP、命令执行
 和其他子系统 channel。连接治理应限制 TCP 握手，而不是把所有业务操作强制串行。
 
+## 当前实现
+
+`sshbridge/ops.py::_maybe_session` 在调用方未提供 session 时，每次操作都会创建新的
+SFTP 连接：
+
+```python
+@contextmanager
+def _maybe_session(profile, session):
+    if session is None:
+        with _session(profile) as s:
+            yield s
+    else:
+        yield session
+```
+
+`sshbridge/daemon.py::_run_op` 会复用一个 SFTP session，但所有操作共用同一把锁：
+
+```python
+with state["lock"]:
+    if state["session"] is None or state["session"]._closed:
+        state["session"] = SftpSession(
+            profile.sftp_argv(), profile.op_timeout)
+    return _dispatch(profile, op, args, state["session"])
+```
+
+`sshbridge/web.py::WorkspaceService` 也持有自己的 SFTP session，因此 Web 与 daemon
+同时运行时仍会建立两条独立连接。当前没有跨进程的唯一连接所有者。
+
 ## 痛点
 
 - CLI 找不到 daemon 时会回退到直接连接。
