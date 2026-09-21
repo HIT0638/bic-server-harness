@@ -100,6 +100,30 @@ def build_parser():
                        help="sha256 of a remote file (for conflict checks)")
     p.add_argument("path")
 
+    p = sub.add_parser(
+        "sync", parents=[common],
+        help="manage optional brokered Rsync transfer jobs")
+    ssub = p.add_subparsers(dest="sync_cmd")
+    ssub.required = True
+    sp = ssub.add_parser(
+        "push", parents=[common],
+        help="queue local files/directories for upload")
+    sp.add_argument("sources", nargs="+", metavar="LOCAL")
+    sp.add_argument("--to", dest="destination", required=True,
+                    metavar="REMOTE_DIR")
+    sp = ssub.add_parser(
+        "pull", parents=[common],
+        help="queue one remote file/directory for download")
+    sp.add_argument("source", metavar="REMOTE")
+    sp.add_argument("--to", dest="destination", required=True,
+                    metavar="LOCAL_DIR")
+    sp = ssub.add_parser(
+        "status", parents=[common], help="show a sync job")
+    sp.add_argument("job_id", metavar="JOB_ID")
+    sp = ssub.add_parser(
+        "cancel", parents=[common], help="cancel a sync job")
+    sp.add_argument("job_id", metavar="JOB_ID")
+
     p = sub.add_parser("serve", parents=[common],
                        help="start the local Web file explorer")
     p.add_argument("--port", type=int, default=8765, metavar="PORT",
@@ -275,6 +299,42 @@ def _broker_mgmt(args, client):
     raise BridgeError("INVALID_ARG", "unknown broker command: %s" % cmd)
 
 
+def _broker_sync(args, client):
+    status = client.ensure_started()
+    if "rsync" not in status.get("features", []):
+        raise BridgeError(
+            "BROKER_RESTART_REQUIRED",
+            "running broker does not support rsync; stop it and retry")
+    if args.sync_cmd == "push":
+        operation = "sync_start"
+        arguments = {
+            "direction": "push",
+            "sources": list(args.sources),
+            "destination": args.destination,
+        }
+        timeout = 120
+    elif args.sync_cmd == "pull":
+        operation = "sync_start"
+        arguments = {
+            "direction": "pull",
+            "sources": [args.source],
+            "destination": args.destination,
+        }
+        timeout = 120
+    elif args.sync_cmd == "status":
+        operation = "sync_status"
+        arguments = {"job_id": args.job_id}
+        timeout = 5
+    elif args.sync_cmd == "cancel":
+        operation = "sync_cancel"
+        arguments = {"job_id": args.job_id}
+        timeout = 10
+    else:
+        raise BridgeError(
+            "INVALID_ARG", "unknown sync command: %s" % args.sync_cmd)
+    return client.request(operation, arguments, timeout=timeout), None
+
+
 def _render_text(args, r):
     op = args.op
     if op == "ls":
@@ -310,6 +370,17 @@ def _render_text(args, r):
     elif op in ("broker", "daemon"):
         for k in sorted(r):
             print("%-16s %s" % (k, r[k]))
+    elif op == "sync":
+        print("sync job %s: %s" % (r["job_id"], r["state"]))
+        if r.get("files_transferred") is not None:
+            print("files_transferred %s" % r["files_transferred"])
+        if r.get("bytes_transferred") is not None:
+            print("bytes_transferred %s" % r["bytes_transferred"])
+        if r.get("error"):
+            print(
+                "error [%s]: %s"
+                % (r["error"].get("code"), r["error"].get("message")),
+                file=sys.stderr)
     elif op == "exec":
         sys.stdout.write(r["stdout"])
         sys.stderr.write(r["stderr"])
@@ -357,6 +428,12 @@ def main(argv=None):
             return serve(
                 profile, config_path=cfg["file"], port=args.port,
                 open_browser=not args.no_open)
+        elif args.op == "sync":
+            if broker_client is None:
+                raise BridgeError(
+                    "BROKER_UNSUPPORTED",
+                    "sync requires connection_policy.mode=broker")
+            result, raw = _broker_sync(args, broker_client)
         elif args.op in ("broker", "daemon"):
             if broker_client is None:
                 raise BridgeError(

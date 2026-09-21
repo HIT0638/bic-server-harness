@@ -5,9 +5,11 @@ import stat
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
-from sshbridge.broker import BrokerServer
+from sshbridge import cli
+from sshbridge.broker import BrokerServer, BrokerState
 from sshbridge.broker_client import (
     BrokerEndpoint, _broker_launch_argv, profile_fingerprint)
 from sshbridge.config import Profile
@@ -301,6 +303,201 @@ class TestBrokerProtocol(unittest.TestCase):
                 finally:
                     first.close()
                     second.close()
+
+
+class FakeSyncClient:
+    def __init__(self, features=None):
+        self.features = features if features is not None else [
+            "sftp", "exec", "rsync"]
+        self.requests = []
+
+    def ensure_started(self):
+        return {"features": self.features}
+
+    def request(self, operation, arguments, timeout=None):
+        self.requests.append((operation, arguments, timeout))
+        return {
+            "job_id": arguments.get("job_id", "job-1"),
+            "direction": arguments.get("direction", "push"),
+            "state": "queued",
+        }
+
+
+class FakeRsyncManager:
+    def __init__(self):
+        self.calls = []
+        self.invalidated = 0
+        self.closed = False
+
+    def start(self, direction, sources, destination):
+        self.calls.append(
+            ("start", direction, list(sources), destination))
+        return {
+            "job_id": "job-1",
+            "direction": direction,
+            "state": "queued",
+        }
+
+    def status(self, job_id):
+        self.calls.append(("status", job_id))
+        return {"job_id": job_id, "state": "running"}
+
+    def cancel(self, job_id):
+        self.calls.append(("cancel", job_id))
+        return {"job_id": job_id, "state": "cancelled"}
+
+    def snapshot(self):
+        return {
+            "sync_active": 1,
+            "sync_queued": 2,
+            "sync_history": 3,
+            "rsync_capability": {
+                "state": "available",
+                "local_version": "3.2.7",
+                "remote_version": "3.2.7",
+                "reason": None,
+            },
+        }
+
+    def invalidate_capabilities(self):
+        self.invalidated += 1
+
+    def close(self):
+        self.closed = True
+
+
+class TestBrokerSyncRouting(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.state_patch = mock.patch.dict(
+            os.environ,
+            {"SSHBRIDGE_STATE_DIR": self.temp.name},
+            clear=False)
+        self.state_patch.start()
+        self.profile = Profile("test", profile_raw())
+        self.endpoint = BrokerEndpoint("/tmp/bridge.json", self.profile)
+        self.manager = FakeRsyncManager()
+        patcher = mock.patch(
+            "sshbridge.broker.RsyncManager",
+            return_value=self.manager)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.state = BrokerState(
+            self.profile, self.endpoint, "instance")
+        self.state.ensure_ready = mock.Mock()
+
+    def tearDown(self):
+        self.state.close()
+        self.state_patch.stop()
+        self.temp.cleanup()
+
+    def test_snapshot_exposes_features_and_sync_state(self):
+        snapshot = self.state.snapshot()
+        self.assertEqual(
+            snapshot["features"], ["sftp", "exec", "rsync"])
+        self.assertEqual(snapshot["sync_active"], 1)
+        self.assertEqual(snapshot["sync_queued"], 2)
+        self.assertEqual(snapshot["sync_history"], 3)
+        self.assertEqual(
+            snapshot["rsync_capability"]["state"], "available")
+
+    def test_sync_operations_route_to_manager(self):
+        started = self.state.run("sync_start", {
+            "direction": "push",
+            "sources": ["one", "two"],
+            "destination": "/remote",
+        })
+        self.assertEqual(started["job_id"], "job-1")
+        self.state.ensure_ready.assert_called_once_with()
+        self.assertEqual(self.manager.calls[-1], (
+            "start", "push", ["one", "two"], "/remote"))
+
+        self.assertEqual(
+            self.state.run(
+                "sync_status", {"job_id": "job-1"})["state"],
+            "running")
+        self.assertEqual(
+            self.state.run(
+                "sync_cancel", {"job_id": "job-1"})["state"],
+            "cancelled")
+
+    def test_reconnect_invalidates_capability_and_close_stops_manager(self):
+        self.state.transport.stop = mock.Mock()
+        self.state.reconnect()
+        self.assertEqual(self.manager.invalidated, 1)
+        self.state.close()
+        self.assertTrue(self.manager.closed)
+
+
+class TestSyncCli(unittest.TestCase):
+    def test_parser_accepts_sync_commands(self):
+        parser = cli.build_parser()
+        push = parser.parse_args([
+            "sync", "push", "one", "two", "--to", "/remote"])
+        self.assertEqual(push.sync_cmd, "push")
+        self.assertEqual(push.sources, ["one", "two"])
+        self.assertEqual(push.destination, "/remote")
+
+        pull = parser.parse_args([
+            "sync", "pull", "/remote/file", "--to", "/local"])
+        self.assertEqual(pull.sync_cmd, "pull")
+        self.assertEqual(pull.source, "/remote/file")
+        self.assertEqual(pull.destination, "/local")
+
+        status = parser.parse_args(["sync", "status", "job-1"])
+        self.assertEqual(status.sync_cmd, "status")
+        self.assertEqual(status.job_id, "job-1")
+
+    def test_sync_dispatch_builds_broker_requests(self):
+        client = FakeSyncClient()
+        cases = [
+            (
+                SimpleNamespace(
+                    sync_cmd="push", sources=["one", "two"],
+                    destination="/remote"),
+                "sync_start",
+                {
+                    "direction": "push",
+                    "sources": ["one", "two"],
+                    "destination": "/remote",
+                },
+            ),
+            (
+                SimpleNamespace(
+                    sync_cmd="pull", source="/remote/file",
+                    destination="/local"),
+                "sync_start",
+                {
+                    "direction": "pull",
+                    "sources": ["/remote/file"],
+                    "destination": "/local",
+                },
+            ),
+            (
+                SimpleNamespace(sync_cmd="status", job_id="job-1"),
+                "sync_status",
+                {"job_id": "job-1"},
+            ),
+            (
+                SimpleNamespace(sync_cmd="cancel", job_id="job-1"),
+                "sync_cancel",
+                {"job_id": "job-1"},
+            ),
+        ]
+        for arguments, operation, payload in cases:
+            with self.subTest(operation=operation):
+                cli._broker_sync(arguments, client)
+                self.assertEqual(
+                    client.requests[-1][:2], (operation, payload))
+
+    def test_sync_requires_new_broker_feature(self):
+        client = FakeSyncClient(features=["sftp", "exec"])
+        arguments = SimpleNamespace(
+            sync_cmd="push", sources=["one"], destination="/remote")
+        with self.assertRaises(BridgeError) as caught:
+            cli._broker_sync(arguments, client)
+        self.assertEqual(
+            caught.exception.code, "BROKER_RESTART_REQUIRED")
 
 
 if __name__ == "__main__":

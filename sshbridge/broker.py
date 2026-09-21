@@ -21,6 +21,7 @@ from .broker_client import (MAX_MESSAGE, PROTOCOL_VERSION, BrokerEndpoint,
 from .config import Profile, load_config
 from .errors import BridgeError
 from .exec_client import is_ssh_transport_failure, run_exec
+from .rsync import RsyncManager
 from .sftp_client import SftpSession
 from .transport import OpenSSHTransport
 
@@ -52,10 +53,16 @@ class BrokerState:
         self.queued_exec = 0
         self.ops_served = 0
         self.tcp_generation = 0
+        self.rsync = RsyncManager(
+            profile,
+            self.transport,
+            remote_stat=self._rsync_remote_stat,
+            remote_probe=self._execute,
+            on_transport_error=self._mark_open)
 
     def snapshot(self):
         with self.state_lock:
-            return {
+            result = {
                 "profile": self.profile.name,
                 "profile_fingerprint": self.endpoint.fingerprint,
                 "pid": os.getpid(),
@@ -79,7 +86,10 @@ class BrokerState:
                 "multiplexing": self.transport.multiplexing,
                 "exec_concurrency": self.exec_limit,
                 "degraded_reason": self.transport.degraded_reason,
+                "features": ["sftp", "exec", "rsync"],
             }
+        result.update(self.rsync.snapshot())
+        return result
 
     def ensure_ready(self, manual=False):
         with self.connect_lock:
@@ -152,6 +162,7 @@ class BrokerState:
                     self.last_error = None
             with self.sftp_lock:
                 self._drop_session_unlocked()
+            self.rsync.invalidate_capabilities()
             self.transport.stop()
             self.ensure_ready(manual=True)
         return self.snapshot()
@@ -159,13 +170,24 @@ class BrokerState:
     def run(self, op, arguments):
         if op not in {
                 "list_dir", "stat", "read_file", "write_file",
-                "mkdir", "move", "delete", "exec", "hash"}:
+                "mkdir", "move", "delete", "exec", "hash",
+                "sync_start", "sync_status", "sync_cancel"}:
             raise BridgeError(
                 "INVALID_ARG", "unknown broker operation: %s" % op)
         with self.state_lock:
             self.ops_served += 1
         if op == "exec":
             return self._run_exec_op(arguments)
+        if op == "sync_start":
+            self.ensure_ready()
+            return self.rsync.start(
+                arguments["direction"],
+                arguments["sources"],
+                arguments["destination"])
+        if op == "sync_status":
+            return self.rsync.status(arguments["job_id"])
+        if op == "sync_cancel":
+            return self.rsync.cancel(arguments["job_id"])
         return self._run_sftp_op(op, arguments)
 
     def _run_sftp_op(self, op, arguments):
@@ -289,6 +311,9 @@ class BrokerState:
                 self.active_exec -= 1
             self.exec_semaphore.release()
 
+    def _rsync_remote_stat(self, path):
+        return self._run_sftp_op("stat", {"path": path})
+
     def _probe_direct_connection(self):
         self._begin_direct_connection()
         result = run_exec(
@@ -355,6 +380,7 @@ class BrokerState:
         self.session = None
 
     def close(self):
+        self.rsync.close()
         with self.sftp_lock:
             self._drop_session_unlocked()
         self.transport.stop()
