@@ -74,6 +74,12 @@ glibc 2.17 的老旧 Linux 服务器；只假定远端存在 OpenSSH、SFTP 与 
 stdout、stderr、退出码和超时状态必须结构化返回。本地 SSH 超时不能证明远端进程已
 终止；结果中必须保留该提示。
 
+异步 Exec job 只能由 Broker 内的 `ExecJobManager` 管理。同步与异步 Exec 必须共用
+同一队列、并发限制、进程生命周期和输出上限；不得让请求 handler 阻塞充当等待队列。
+队列、单 job 输出和 job registry 必须有明确上限。job 输出不得写入日志，也不得在
+状态结果中暴露完整命令、真实 root、SSH 参数或本地进程信息。取消或超时只能声明
+本地 SSH channel 已终止，不得宣称远端进程已终止。
+
 ## Broker 规则
 
 macOS/Linux 的 CLI、Web、Desktop 和 MCP 入口必须通过 Connection Broker 访问正式
@@ -81,7 +87,8 @@ profile，不得增加 Broker 失败后的隐藏直连回退。`direct` 模式�
 诊断和兼容场景。
 
 Broker 对每个 profile 只管理一个 OpenSSH ControlMaster 和一个顺序 SFTP channel。
-SFTP 锁不得覆盖独立 Exec I/O；Exec 通过独立 semaphore 限制并发。
+SFTP 锁不得覆盖独立 Exec I/O；Exec 通过 Broker 内的有界任务管理器限制并发。
+异步 Exec 不得绕过 Broker。长命令状态使用短连接轮询，不得长期占用 IPC response。
 
 Broker 只能监听当前用户私有运行目录中的 Unix socket。运行目录必须为 `0700`，
 socket 和 metadata 必须为 `0600`，并保留 profile fingerprint、协议版本、

@@ -11,6 +11,11 @@
       "connection_policy": {
         "mode": "broker",
         "exec_concurrency": 2,
+        "exec_queue_limit": 8,
+        "exec_queue_timeout": 60,
+        "exec_output_limit_bytes": 4194304,
+        "exec_job_ttl": 600,
+        "exec_max_jobs": 32,
         "min_connect_interval": 10,
         "connect_retries": 0,
         "auto_reconnect": false,

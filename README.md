@@ -13,7 +13,8 @@ Node.js、新版 glibc 或 Agent Runtime。
 ## 功能
 
 - 经由 SFTP 提供 `ls`、`stat`、`read`、`write`、`mkdir`、`mv` 与 `rm`。
-- 经由系统 `ssh` 提供 `exec`，返回结构化 stdout、stderr、退出码和超时状态。
+- 经由系统 `ssh` 提供同步 `exec` 与 Broker 内存态异步 Exec job。
+- 异步 job 支持状态查询、stdout/stderr 增量 cursor、主动取消和有界输出保留。
 - 配置工作区根目录。文件路径均为虚拟路径：`/` 映射到该目录，不是远端系统根目录。
 - 文件操作执行词法路径收敛及 `REALPATH` 后的根目录包含性检查。
 - 服务端支持 `posix-rename@openssh.com` 时，使用临时文件完成原子替换。
@@ -27,7 +28,7 @@ Node.js、新版 glibc 或 Agent Runtime。
 - 本地 Web Explorer 提供懒加载目录树、文本查看与编辑、新建和重命名。
 - macOS Desktop 使用 Cocoa 窗口承载同一套 Explorer，并继续复用 loopback API 与
   Connection Broker。
-- 本地 stdio MCP Server 将文件、命令和连接恢复能力暴露为 11 个 MCP tools，并与
+- 本地 stdio MCP Server 将文件、命令和连接恢复能力暴露为 14 个 MCP tools，并与
   CLI、Web 和 Desktop 共享同一 Broker。
 
 ## 前置条件
@@ -65,6 +66,11 @@ cp bridge.example.json bridge.json
       "connection_policy": {
         "mode": "broker",
         "exec_concurrency": 2,
+        "exec_queue_limit": 8,
+        "exec_queue_timeout": 60,
+        "exec_output_limit_bytes": 4194304,
+        "exec_job_ttl": 600,
+        "exec_max_jobs": 32,
         "min_connect_interval": 10,
         "connect_retries": 0,
         "auto_reconnect": false,
@@ -105,6 +111,9 @@ python3 remote.py --config bridge.json mkdir -p /build/output
 python3 remote.py --config bridge.json mv /build/a.txt /build/b.txt
 python3 remote.py --config bridge.json rm /build/b.txt
 python3 remote.py --config bridge.json exec --cwd / -- python3 src/main.py
+python3 remote.py --config bridge.json exec-start --cwd / -- make test
+python3 remote.py --config bridge.json exec-status JOB_ID --cursor 0
+python3 remote.py --config bridge.json exec-cancel JOB_ID
 ```
 
 使用 `--json` 获取结构化输出：
@@ -116,6 +125,12 @@ python3 remote.py --config bridge.json --json exec --cwd / -- python3 src/main.p
 
 普通模式下，`read` 将原始字节写入 stdout。JSON 模式同时返回 UTF-8 替换文本
 与 Base64 数据。
+
+`exec-start` 立即返回 job ID。调用方使用 `exec-status` 轮询，并将响应中的
+`next_cursor` 传给下一次查询；stdout 与 stderr 仍以独立 event 返回。
+`has_more=true` 表示当前页后仍有输出。`output_truncated=true` 或
+`truncated_before=true` 表示较早输出已因上限被淘汰。job 状态为：
+`QUEUED`、`RUNNING`、`EXITED`、`TIMED_OUT`、`CANCELED`、`FAILED`。
 
 要启用乐观并发控制，先从 `stat` 或 `read` 保存 `mtime` 与 `size`，
 再传给 `write`：
@@ -238,6 +253,13 @@ OpenSSH ControlMaster 可用时，Broker 持有一个 TCP、一个顺序 SFTP ch
 不支持时，SFTP 仍保持一个连接，Exec 降为单并发且每次建连受
 `min_connect_interval` 限制。
 
+同步与异步 Exec 共用同一个有界任务管理器。默认等待队列为 8，排队超时 60 秒，
+每个 job 最多保留 4 MiB 输出，终态保留 600 秒，registry 最多保留 32 个 job。
+这些限制分别由 `exec_queue_limit`、`exec_queue_timeout`、
+`exec_output_limit_bytes`、`exec_job_ttl` 和 `exec_max_jobs` 配置。
+job 只保存在当前 Broker 内存中，Broker 重启后旧 job ID 返回
+`EXEC_JOB_NOT_FOUND`。
+
 ## MCP Server
 
 MCP MVP 使用官方 MCP Python SDK `2.2.0` 和 stdio transport。SDK 要求 Python
@@ -276,7 +298,8 @@ MCP Host 配置必须使用 Python 和配置文件的绝对路径：
 
 ```text
 list_dir  stat  read_file  hash_file  connection_status
-write_file  mkdir  move  delete  exec  reconnect
+write_file  mkdir  move  delete  exec
+exec_start  exec_status  exec_cancel  reconnect
 ```
 
 MCP 只支持 `connection_policy.mode=broker`。多个 MCP Host 使用相同 config/profile
@@ -289,9 +312,9 @@ MCP 只支持 `connection_policy.mode=broker`。多个 MCP Host 使用相同 con
 `code/message/details` 的单行 JSON。返回内容不会包含 `real_path`、`real_cwd`
 或配置的真实远端 root。
 
-`exec` 默认启用并标记为破坏性开放世界操作。其 `cwd` 只是起始目录，不是命令
-沙箱。`reconnect` 只触发一次 Broker 门控的显式恢复；MCP 不提供停止共享 Broker
-的 tool。
+`exec` 与 `exec_start` 默认启用并标记为破坏性开放世界操作。其 `cwd` 只是起始
+目录，不是命令沙箱。`exec_status` 单次最多返回 64 KiB 原始输出。
+`reconnect` 只触发一次 Broker 门控的显式恢复；MCP 不提供停止共享 Broker 的 tool。
 
 ## 安全边界
 
@@ -302,7 +325,8 @@ SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的
 访问其他远端路径。完整命令沙箱需要远端账户、容器、chroot 或 `sshd` 策略；
 本桥接层无法在本地保证此限制。
 
-超时时会终止本地 `ssh` 进程，远端进程仍可能继续运行。未提供
+超时或取消运行中 job 时只保证终止本地 `ssh` 进程，结果会返回
+`remote_termination_unknown=true`；远端进程仍可能继续运行。未提供
 `posix-rename@openssh.com` 的服务器会使用非原子的覆盖回退路径。
 
 ## 架构
@@ -316,6 +340,7 @@ SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的
 - `sshbridge/sftp_client.py`：运行于 `ssh -s sftp` 的 SFTP v3 客户端。
 - `sshbridge/sftp_proto.py`：SFTP 报文编解码。
 - `sshbridge/exec_client.py`：通过 `ssh` 执行远端命令。
+- `sshbridge/exec_jobs.py`：有界 Exec 队列、状态机、输出 cursor 与进程生命周期。
 - `sshbridge/daemon.py`：旧 daemon 命令的 Broker 兼容入口。
 - `sshbridge/mcp_server.py`：stdio MCP、Tool Schema、Broker Adapter 与错误转换。
 - `sshbridge/web.py`：本地 Web/API 服务、token 鉴权和 Broker 调用。
@@ -335,7 +360,7 @@ python3 -m compileall -q sshbridge remote.py
 ```
 
 安装 MCP 可选依赖后，再使用 Python 3.12 运行同一套命令。MCP 专项测试覆盖 SDK
-内存 Client、真实 stdio 子进程、11 个 tools、错误转换、输出限制、双客户端
+内存 Client、真实 stdio 子进程、14 个 tools、错误转换、输出限制、双客户端
 Broker 复用和显式重连；未安装 SDK 时只跳过这些专项断言。
 
 测试套件会尝试启动隔离的本地 OpenSSH 服务。该服务：
@@ -350,8 +375,8 @@ Broker 复用和显式重连；未安装 SDK 时只跳过这些专项断言。
 
 本地缺少 `ssh`、`sshd` 或 `ssh-keygen` 时，集成测试自动跳过；路径与协议单元测试
 仍会运行。当前集成测试覆盖真实 SFTP 文件流程、并发冲突、符号链接逃逸、大文件限制、
-结构化命令结果、超时、CLI JSON、Broker 连接复用、熔断、并发队列、Web API 和
-MCP stdio。
+结构化命令结果、异步增量输出、取消、超时、CLI JSON、Broker 连接复用、熔断、
+有界并发队列、Web API 和 MCP stdio。
 
 也可手动启动测试环境：
 
@@ -371,6 +396,6 @@ Git 中的原始测试文件。
 
 ## 状态
 
-CLI、Connection Broker、Web Explorer、macOS Desktop MVP 与 stdio MCP Server
-MVP 已实现。Rsync channel、Windows named pipe 和可分发的签名 Desktop 安装包仍是
-后续工作。
+CLI、Connection Broker、同步/异步 Exec、Web Explorer、macOS Desktop MVP 与
+stdio MCP Server MVP 已实现。Rsync channel、Windows named pipe 和可分发的签名
+Desktop 安装包仍是后续工作。
