@@ -24,6 +24,11 @@ DEFAULTS = {
 CONNECTION_POLICY_DEFAULTS = {
     "mode": "direct" if sys.platform == "win32" else "broker",
     "exec_concurrency": 2,
+    "exec_queue_limit": 8,
+    "exec_queue_timeout": 60,
+    "exec_output_limit_bytes": 4 * 1024 * 1024,
+    "exec_job_ttl": 600,
+    "exec_max_jobs": 32,
     "min_connect_interval": 10,
     "connect_retries": 0,
     "auto_reconnect": False,
@@ -130,6 +135,37 @@ class Profile:
                 "INVALID_CONFIG",
                 "profile %s: connection_policy.exec_concurrency "
                 "must be an integer from 1 to 3" % self.name)
+        integer_ranges = {
+            "exec_queue_limit": (0, 64),
+            "exec_output_limit_bytes": (65536, 67108864),
+            "exec_max_jobs": (1, 256),
+        }
+        for key, (minimum, maximum) in integer_ranges.items():
+            value = policy[key]
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or not (minimum <= value <= maximum):
+                raise BridgeError(
+                    "INVALID_CONFIG",
+                    "profile %s: connection_policy.%s must be an integer "
+                    "from %d to %d"
+                    % (self.name, key, minimum, maximum))
+        for key in ("exec_queue_timeout", "exec_job_ttl"):
+            value = policy[key]
+            if not isinstance(value, (int, float)) \
+                    or isinstance(value, bool) \
+                    or not (0 < value <= 86400):
+                raise BridgeError(
+                    "INVALID_CONFIG",
+                    "profile %s: connection_policy.%s must be > 0 and "
+                    "<= 86400" % (self.name, key))
+        minimum_jobs = (
+            policy["exec_concurrency"] + policy["exec_queue_limit"])
+        if policy["exec_max_jobs"] < minimum_jobs:
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: connection_policy.exec_max_jobs must be >= "
+                "exec_concurrency + exec_queue_limit (%d)"
+                % (self.name, minimum_jobs))
         for key in ("min_connect_interval", "cooldown_initial",
                     "cooldown_max"):
             value = policy[key]
