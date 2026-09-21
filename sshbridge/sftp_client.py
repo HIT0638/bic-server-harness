@@ -326,6 +326,13 @@ class SftpSession:
         except Exception:
             try:
                 self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+        for pipe in (self.proc.stdout, self.proc.stderr):
+            try:
+                if pipe:
+                    pipe.close()
             except Exception:
                 pass
 
@@ -346,5 +353,6 @@ class SftpSession:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        _ = (_exc_type, _exc_value, _traceback)
         self.shutdown()

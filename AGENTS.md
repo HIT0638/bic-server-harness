@@ -17,6 +17,9 @@ glibc 2.17 的老旧 Linux 服务器；只假定远端存在 OpenSSH、SFTP 与 
 - 目录访问必须懒加载。不得递归扫描远端，也不得依赖长期运行的 `tree`。
 - `sshbridge/ops.py` 必须保持传输层无关。CLI 与未来 MCP handler 应调用它，
   不得重复实现操作逻辑。
+- Web Explorer 必须固定监听 loopback，API 必须使用随机 token 鉴权。
+- Web API 只返回虚拟工作区路径，不得暴露真实远端根路径、SSH 参数或凭据。
+- Web 前端不得直接连接 SSH；所有文件操作必须通过本地 API 和 `sshbridge/ops.py`。
 
 ## 文件系统安全
 

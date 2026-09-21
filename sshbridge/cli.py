@@ -99,6 +99,13 @@ def build_parser():
                        help="sha256 of a remote file (for conflict checks)")
     p.add_argument("path")
 
+    p = sub.add_parser("serve", parents=[common],
+                       help="start the local Web file explorer")
+    p.add_argument("--port", type=int, default=8765, metavar="PORT",
+                   help="localhost port (default: 8765; use 0 for a random port)")
+    p.add_argument("--no-open", action="store_true",
+                   help="do not open the browser automatically")
+
     p = sub.add_parser("daemon", parents=[common],
                        help="manage the local connection-reuse daemon "
                             "(one persistent SFTP session for all file ops)")
@@ -385,7 +392,14 @@ def main(argv=None):
             raise BridgeError("INVALID_CONFIG", "unknown profile: %s (have: %s)"
                               % (pname, ", ".join(cfg["profiles"])))
         profile = Profile(pname, cfg["profiles"][pname])
-        if args.op == "daemon":
+        if args.op == "serve":
+            if args.json:
+                raise BridgeError(
+                    "INVALID_ARG", "--json is not supported with serve")
+            from .web import serve
+            return serve(
+                profile, port=args.port, open_browser=not args.no_open)
+        elif args.op == "daemon":
             result, raw = _daemon_mgmt(args, cfg, pname)
         else:
             # transparently reuse the daemon's persistent connection when up

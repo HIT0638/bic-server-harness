@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remote Explorer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">&gt;_</span>
+        <span>Remote Explorer</span>
+      </div>
+      <div class="connection">
+        <span id="connection-dot" class="connection-dot"></span>
+        <span id="profile-name">连接中</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="explorer" aria-label="远程文件">
+        <div class="panel-header">
+          <h1>远程文件</h1>
+          <div class="toolbar">
+            <button id="new-file" class="icon-button" type="button"
+                    title="新建文件" aria-label="新建文件">＋</button>
+            <button id="new-folder" class="icon-button" type="button"
+                    title="新建目录" aria-label="新建目录">□</button>
+            <button id="rename-entry" class="icon-button" type="button"
+                    title="重命名" aria-label="重命名">✎</button>
+            <button id="refresh-tree" class="icon-button" type="button"
+                    title="刷新" aria-label="刷新">↻</button>
+          </div>
+        </div>
+        <div id="tree" class="tree" role="tree" aria-label="远程目录树"></div>
+      </aside>
+
+      <section class="editor-pane">
+        <div class="editor-header">
+          <div class="file-heading">
+            <span id="dirty-indicator" class="dirty-indicator" aria-hidden="true"></span>
+            <span id="current-path">未打开文件</span>
+          </div>
+          <button id="save-file" class="save-button" type="button" disabled>
+            <span aria-hidden="true">✓</span>
+            <span>保存</span>
+          </button>
+        </div>
+
+        <div id="empty-state" class="empty-state">
+          <span class="empty-mark" aria-hidden="true">&gt;_</span>
+          <span>未打开文件</span>
+        </div>
+
+        <div id="file-view" class="file-view" hidden>
+          <textarea id="editor" spellcheck="false" aria-label="文件内容"></textarea>
+          <div id="readonly-view" class="readonly-view" hidden></div>
+        </div>
+
+        <footer class="statusbar">
+          <span id="file-meta">就绪</span>
+          <span id="operation-status"></span>
+        </footer>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

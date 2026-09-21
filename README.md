@@ -22,6 +22,7 @@ Node.js、新版 glibc 或 Agent Runtime。
 - 复用用户 SSH 配置、SSH Agent、`ProxyJump`、known hosts 与支持的
   OpenSSH 连接复用。
 - 可选本地 daemon，为重复文件操作保留一个 SFTP 会话。
+- 本地 Web Explorer 提供懒加载目录树、文本查看与编辑、新建和重命名。
 
 ## 前置条件
 
@@ -103,6 +104,34 @@ python3 remote.py --config bridge.json write /src/main.py \
   --expected-size 42
 ```
 
+## Web 文件浏览器
+
+启动本地 Web Explorer：
+
+```sh
+python3 remote.py --config bridge.json serve
+```
+
+服务默认监听 `127.0.0.1:8765`，输出带随机访问 token 的 URL，并自动打开浏览器。
+端口被占用时可指定其他端口，也可让系统分配随机端口：
+
+```sh
+python3 remote.py --config bridge.json serve --port 0 --no-open
+```
+
+当前 MVP 提供：
+
+- 展开目录时才执行 `list_dir`，不会递归扫描远端。
+- 查看与编辑 UTF-8 文本文件。
+- 保存时使用 mtime 与文件大小检查远端并发修改。
+- 新建文件、新建目录、重命名和刷新。
+- 二进制文件与超过 `max_read_bytes` 的文件只显示元数据，不进入编辑器。
+- 一个由服务进程持有并串行访问的常驻 SFTP 会话。
+
+Web 服务固定绑定 `127.0.0.1`，不能通过参数改为外网地址。API 请求必须携带启动时
+生成的随机 token。浏览器只使用虚拟工作区路径，API 不返回真实远端根路径或 SSH
+凭据。关闭 `remote serve` 后 token 立即失效。
+
 ## Daemon
 
 可选 daemon 保留一个 SFTP 连接。远端路径限制新建 SSH 连接时，可减少连接次数。
@@ -137,6 +166,8 @@ SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的
 - `sshbridge/sftp_proto.py`：SFTP 报文编解码。
 - `sshbridge/exec_client.py`：通过 `ssh` 执行远端命令。
 - `sshbridge/daemon.py`：可选的常驻本地 SFTP daemon。
+- `sshbridge/web.py`：本地 Web/API 服务、token 鉴权和 SFTP 会话复用。
+- `sshbridge/web_assets/`：远程目录树与文本编辑界面。
 - `sshbridge/config.py`：profile 解析与 OpenSSH 调用选项。
 
 `ops.py` 将作为未来 MCP tools 的后端。新增传输层入口应保持轻量，并复用这些操作函数。
@@ -159,7 +190,7 @@ python3 -m compileall -q sshbridge remote.py
 
 本地缺少 `ssh`、`sshd` 或 `ssh-keygen` 时，集成测试自动跳过；路径与协议单元测试
 仍会运行。当前集成测试覆盖真实 SFTP 文件流程、并发冲突、符号链接逃逸、大文件限制、
-结构化命令结果、超时、CLI JSON 和 daemon 连接复用。
+结构化命令结果、超时、CLI JSON、daemon 连接复用和 Web API。
 
 也可手动启动测试环境：
 
@@ -175,4 +206,4 @@ daemon 状态文件仍位于项目根目录。
 
 ## 状态
 
-CLI MVP 已实现。MCP Server 封装仍是后续工作。
+CLI 与 Web Explorer MVP 已实现。MCP Server 封装仍是后续工作。

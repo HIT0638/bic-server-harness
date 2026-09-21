@@ -154,6 +154,7 @@ def op_read_file(profile, path, offset=0, limit=None, session=None):
         "path": path,
         "real_path": canon,
         "size": size,
+        "mtime": attrs.get("mtime"),
         "offset": offset,
         "length": len(data),
         "truncated": (offset + len(data)) < size,
