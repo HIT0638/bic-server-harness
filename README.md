@@ -27,6 +27,8 @@ Node.js、新版 glibc 或 Agent Runtime。
 - 本地 Web Explorer 提供懒加载目录树、文本查看与编辑、新建和重命名。
 - macOS Desktop 使用 Cocoa 窗口承载同一套 Explorer，并继续复用 loopback API 与
   Connection Broker。
+- 本地 stdio MCP Server 将文件、命令和连接恢复能力暴露为 11 个 MCP tools，并与
+  CLI、Web 和 Desktop 共享同一 Broker。
 
 ## 前置条件
 
@@ -35,8 +37,9 @@ Node.js、新版 glibc 或 Agent Runtime。
 - 远端 `sshd` 已启用 SFTP 子系统。
 - 仅使用 `hash` 或 `write --expected-hash` 时，远端需要 `sha256sum`。
 
-CLI、Broker 和 Web Explorer 无需第三方 Python 依赖。macOS Desktop 的可选依赖
-单独锁定在 `requirements-desktop-macos.txt`。
+CLI、Broker 和 Web Explorer 无需第三方 Python 依赖。MCP Server 与 macOS Desktop
+的可选依赖分别锁定在 `requirements-mcp.txt` 和
+`requirements-desktop-macos.txt`。
 
 ## 配置
 
@@ -235,6 +238,61 @@ OpenSSH ControlMaster 可用时，Broker 持有一个 TCP、一个顺序 SFTP ch
 不支持时，SFTP 仍保持一个连接，Exec 降为单并发且每次建连受
 `min_connect_interval` 限制。
 
+## MCP Server
+
+MCP MVP 使用官方 MCP Python SDK `2.2.0` 和 stdio transport。SDK 要求 Python
+3.10+；推荐使用独立的 Homebrew Python 3.12 环境，基础 CLI/Broker 仍可由系统
+Python 3.9 运行：
+
+```sh
+/opt/homebrew/opt/python@3.12/bin/python3.12 -m venv .venv/mcp
+.venv/mcp/bin/python -m pip install -r requirements-mcp.txt
+.venv/mcp/bin/python -m sshbridge.mcp_server \
+  --config "$PWD/bridge.json" \
+  --profile legacy-linux
+```
+
+MCP Host 配置必须使用 Python 和配置文件的绝对路径：
+
+```json
+{
+  "mcpServers": {
+    "sshbridge-legacy-linux": {
+      "command": "/absolute/path/BIC-Server-Harness/.venv/mcp/bin/python",
+      "args": [
+        "-m",
+        "sshbridge.mcp_server",
+        "--config",
+        "/absolute/path/BIC-Server-Harness/bridge.json",
+        "--profile",
+        "legacy-linux"
+      ]
+    }
+  }
+}
+```
+
+一个 MCP 进程绑定一个 profile，并提供：
+
+```text
+list_dir  stat  read_file  hash_file  connection_status
+write_file  mkdir  move  delete  exec  reconnect
+```
+
+MCP 只支持 `connection_policy.mode=broker`。多个 MCP Host 使用相同 config/profile
+时会命中同一个 Broker；MCP 进程退出不会停止 Broker。`read_file` 支持严格 UTF-8
+文本或 Base64 分页读取，`write_file` 首期只接受 UTF-8 文本。MCP 输入和序列化结果
+上限为 1 MiB，超限返回 `TOO_LARGE`，不会静默截断。
+
+成功调用返回 `{"ok": true, "result": ...}`。业务失败返回 `isError=true`；SDK
+生成的错误文本以 `Error executing tool <name>:` 开头，后接包含稳定
+`code/message/details` 的单行 JSON。返回内容不会包含 `real_path`、`real_cwd`
+或配置的真实远端 root。
+
+`exec` 默认启用并标记为破坏性开放世界操作。其 `cwd` 只是起始目录，不是命令
+沙箱。`reconnect` 只触发一次 Broker 门控的显式恢复；MCP 不提供停止共享 Broker
+的 tool。
+
 ## 安全边界
 
 文件操作将配置的 `root` 视为工作区根目录，且 `root` 不可为 `/`。桥接层通过
@@ -259,13 +317,15 @@ SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的
 - `sshbridge/sftp_proto.py`：SFTP 报文编解码。
 - `sshbridge/exec_client.py`：通过 `ssh` 执行远端命令。
 - `sshbridge/daemon.py`：旧 daemon 命令的 Broker 兼容入口。
+- `sshbridge/mcp_server.py`：stdio MCP、Tool Schema、Broker Adapter 与错误转换。
 - `sshbridge/web.py`：本地 Web/API 服务、token 鉴权和 Broker 调用。
 - `sshbridge/web_assets/`：远程目录树与文本编辑界面。
 - `sshbridge/desktop.py`：macOS Cocoa 窗口、HTTP 生命周期和桌面配置发现。
 - `packaging/macos/`：py2app 入口、bundled Broker helper 和 arm64 构建脚本。
 - `sshbridge/config.py`：profile 解析与 OpenSSH 调用选项。
 
-`ops.py` 将作为未来 MCP tools 的后端。新增传输层入口应保持轻量，并复用这些操作函数。
+`ops.py` 是唯一业务语义实现。MCP、CLI、Web 和 Desktop 均通过 Broker 间接复用
+这些操作。
 
 ## 测试
 
@@ -273,6 +333,10 @@ SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q sshbridge remote.py
 ```
+
+安装 MCP 可选依赖后，再使用 Python 3.12 运行同一套命令。MCP 专项测试覆盖 SDK
+内存 Client、真实 stdio 子进程、11 个 tools、错误转换、输出限制、双客户端
+Broker 复用和显式重连；未安装 SDK 时只跳过这些专项断言。
 
 测试套件会尝试启动隔离的本地 OpenSSH 服务。该服务：
 
@@ -286,7 +350,8 @@ python3 -m compileall -q sshbridge remote.py
 
 本地缺少 `ssh`、`sshd` 或 `ssh-keygen` 时，集成测试自动跳过；路径与协议单元测试
 仍会运行。当前集成测试覆盖真实 SFTP 文件流程、并发冲突、符号链接逃逸、大文件限制、
-结构化命令结果、超时、CLI JSON、Broker 连接复用、熔断、并发队列和 Web API。
+结构化命令结果、超时、CLI JSON、Broker 连接复用、熔断、并发队列、Web API 和
+MCP stdio。
 
 也可手动启动测试环境：
 
@@ -306,5 +371,6 @@ Git 中的原始测试文件。
 
 ## 状态
 
-CLI、Connection Broker、Web Explorer 与 macOS Desktop MVP 已实现。MCP Server、
-Rsync channel、Windows named pipe 和可分发的签名 Desktop 安装包仍是后续工作。
+CLI、Connection Broker、Web Explorer、macOS Desktop MVP 与 stdio MCP Server
+MVP 已实现。Rsync channel、Windows named pipe 和可分发的签名 Desktop 安装包仍是
+后续工作。

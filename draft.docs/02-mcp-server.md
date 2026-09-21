@@ -2,8 +2,11 @@
 
 ## 状态
 
-stdio MCP MVP 实施中。已确定协议边界、Tool 集合、官方 SDK 版本和测试要求；
-实现完成后将在本节记录对应提交。
+stdio MCP MVP 已实现。
+
+- Runtime：`c7d8330`（`feat: add stdio mcp server`）
+- Tests：`61c2f9f`（`test: verify mcp broker integration`）
+- Config guard：`ef528b3`（`fix: enforce mcp broker configuration`）
 
 ## 背景
 
@@ -34,29 +37,31 @@ flowchart LR
 
 ## 当前实现
 
-MCP Adapter 尚未合入。已经存在可复用的操作层，函数接收 `Profile` 和普通参数，
-返回 JSON-ready 字典。例如 `sshbridge/ops.py::op_list_dir`：
+`sshbridge/mcp_server.py` 使用官方 MCP Python SDK `2.2.0` 注册 11 个 tools。
+模块导入时不加载 SDK；只有 `create_mcp_server` 或 CLI 入口运行时才加载可选依赖。
+`create_mcp_server` 创建一个 profile-bound `BrokerClient` 并只通过它访问远端：
 
 ```python
-def op_list_dir(profile, path="/", session=None):
-    with _maybe_session(profile, session) as s:
-        croot = _canon_root(s, profile)
-        canon = s.realpath(resolve_virtual(path, profile.root))
-        ensure_within_root(canon, croot)
-        _require_dir(s, canon, "list_dir target")
-        raw = s.list_dir(canon)
-    entries = [_entry(n, a) for n, a in sorted(raw, key=lambda e: e[0])]
-    return {"op": "list_dir", "path": path,
-            "real_path": canon, "entries": entries}
+def create_mcp_server(
+        profile,
+        config_path,
+        mcp_module=None,
+        broker_client_factory=BrokerClient):
+    sdk = _sdk_namespace(mcp_module)
+    client = broker_client_factory(config_path, profile)
+    client.ensure_started()
+    adapter = _McpBrokerAdapter(
+        profile, config_path, client, sdk.ToolError)
 ```
 
 Broker 已调用该层，CLI、Web 和 Desktop 通过 Broker 间接复用相同语义。旧 daemon
-入口只是 Broker 兼容别名。MCP 适配器将只调用 `BrokerClient`，不得直接调用
-`ops.py` 或生成 SSH/SFTP 连接。
+入口只是 Broker 兼容别名。MCP Adapter 通过 `asyncio.to_thread` 调用同步
+`BrokerClient.request/status/reconnect`，不直接调用 `ops.py`，也不生成 SSH/SFTP
+连接。MCP 进程退出时不会调用 `BrokerClient.stop()`。
 
 ## 痛点
 
-- Agent 当前只能通过 shell 拼接 CLI 命令。
+- 没有 MCP 时，Agent 只能通过 shell 拼接 CLI 命令。
 - CLI 文本参数不适合可靠传递大段内容和结构化错误。
 - 每个 Agent 若直接调用 `ops.py`，可能各自创建 SSH 连接。
 - MCP 协议可能演进，手写协议增加兼容风险。
@@ -83,7 +88,7 @@ Broker 已调用该层，CLI、Web 和 Desktop 通过 Broker 间接复用相同�
 
 ### 进程与传输
 
-- 新增 `sshbridge/mcp_server.py`。
+- `sshbridge/mcp_server.py` 提供 `create_mcp_server` 和 `app_main`。
 - 使用官方 MCP Python SDK `2.2.0` 和默认 stdio transport，不监听网络端口。
 - SDK 安装在独立 Python 3.12 虚拟环境；基础 CLI/Web/Broker 保持标准库可运行。
 - MCP Server 启动时连接本地 Broker；只允许 `connection_policy.mode=broker`。
@@ -118,7 +123,8 @@ reconnect()
 ### 错误
 
 - `BridgeError` 转换为 SDK `ToolError`，使 Tool Result 的 `isError=true`。
-- 错误文本为包含 `code`、`message` 和 `details` 的单行 canonical JSON。
+- SDK `2.2.0` 在错误文本前添加 `Error executing tool <name>:`；其后为包含
+  `code`、`message` 和 `details` 的单行 canonical JSON。
 - `CONFLICT`、`TOO_LARGE`、`SANDBOX_VIOLATION` 不转换为通用内部错误。
 - broker 不可用时返回 `BROKER_UNAVAILABLE`，不回退直连。
 - 成功与失败结果均移除 `real_path`、`real_cwd`、真实 root、SSH 参数和凭据。
@@ -153,3 +159,7 @@ SSH 密钥、远端 root 和连接策略仍只存在于 bridge 配置和 OpenSSH
 - 保护模式下 broker 不可用时，不产生 SSH 子进程。
 - 使用隔离本地 sshd 完成 MCP 端到端测试。
 - stdio stdout 不包含 banner、日志或 traceback。
+
+上述验收项由 `tests/test_mcp_server.py` 和
+`tests/test_integration_local_sshd.py` 覆盖。MCP SDK 未安装时，基础 Python 3.9
+测试继续执行，SDK 专项测试明确跳过。

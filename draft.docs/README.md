@@ -6,7 +6,7 @@
 ## 草案
 
 - `01-connection-broker.md`：单 profile 连接治理与统一入口，已实现 POSIX MVP。
-- `02-mcp-server.md`：MCP stdio 适配层。
+- `02-mcp-server.md`：MCP stdio 适配层，已实现 MVP。
 - `03-local-ipc-security.md`：Broker 本地 IPC 访问控制，已实现 POSIX Unix socket。
 - `04-exec-security-boundary.md`：任意命令执行的安全边界。
 - `05-atomic-write-portability.md`：不同 SFTP 服务端上的原子覆盖语义。
@@ -22,7 +22,7 @@
 - 不在远端安装 Agent Server、Node Runtime 或新二进制。
 - 继续复用系统 OpenSSH、`~/.ssh/config`、SSH Agent、ProxyJump 和 known_hosts。
 - 文件路径必须受 remote root 沙箱约束。
-- CLI、Web 和未来 MCP 共用相同操作语义。
+- CLI、Web、Desktop 和 MCP 共用相同操作语义与 Connection Broker。
 - 连接治理优先降低新 SSH TCP 握手频率，而不是无条件压低业务并发。
 
 ## 编写规则

@@ -15,8 +15,8 @@ glibc 2.17 的老旧 Linux 服务器；只假定远端存在 OpenSSH、SFTP 与 
   连接复用。不得重写 SSH 认证。
 - 不得要求远端安装二进制文件、Node.js、Python 包、daemon 或新版 glibc。
 - 目录访问必须懒加载。不得递归扫描远端，也不得依赖长期运行的 `tree`。
-- `sshbridge/ops.py` 必须保持传输层无关。CLI 与未来 MCP handler 应调用它，
-  不得重复实现操作逻辑。
+- `sshbridge/ops.py` 必须保持传输层无关并作为唯一业务语义实现。CLI、Web、
+  Desktop 和 MCP 必须通过 Broker 间接调用它，不得重复实现操作逻辑。
 - Web Explorer 必须固定监听 loopback，API 必须使用随机 token 鉴权。
 - Web API 只返回虚拟工作区路径，不得暴露真实远端根路径、SSH 参数或凭据。
 - Web 前端不得直接连接 SSH；所有文件操作必须通过本地 API 和 `sshbridge/ops.py`。
@@ -35,6 +35,23 @@ glibc 2.17 的老旧 Linux 服务器；只假定远端存在 OpenSSH、SFTP 与 
 - Desktop 关闭时必须释放自身 HTTP listener 和线程，但不得停止共享 Broker。
 - 不得为了 Python 侧执行 JavaScript 而放宽现有 CSP；未保存状态读取使用不依赖
   `eval` 的窗口 API。
+
+## MCP 规则
+
+- MCP 只支持 `broker` mode；Broker 不可用时不得回退 direct，也不得直接调用
+  `ops.py`、SFTP、OpenSSH 或 CLI 子进程。
+- MCP 使用 stdio transport，stdout 只能承载 MCP 协议；日志和启动错误只能写
+  stderr。
+- MCP Python SDK 必须保持为 Python 3.12 隔离可选依赖，不得让基础 CLI、Broker、
+  Web 或 Desktop 导入它。
+- 一个 MCP Server 进程只绑定一个 profile。退出时不得停止共享 Broker，不得暴露
+  Broker stop tool。
+- Tool 结果和错误不得返回 `real_path`、`real_cwd`、真实远端 root、SSH 参数或
+  凭据。
+- `read_file` 必须显式区分 UTF-8 文本和 Base64；不得把替换字符文本冒充有效文件
+  内容。MCP 输入和结果上限必须保持明确且可测试。
+- 新增或修改 MCP Tool 时，必须同时验证 JSON Schema、annotations、Broker 参数
+  映射、`isError` 错误语义和 stdio 无 stdout 污染。
 
 ## 文件系统安全
 
@@ -59,7 +76,7 @@ stdout、stderr、退出码和超时状态必须结构化返回。本地 SSH 超
 
 ## Broker 规则
 
-macOS/Linux 的 CLI、Web 和后续 MCP 入口必须通过 Connection Broker 访问正式
+macOS/Linux 的 CLI、Web、Desktop 和 MCP 入口必须通过 Connection Broker 访问正式
 profile，不得增加 Broker 失败后的隐藏直连回退。`direct` 模式只用于显式配置的
 诊断和兼容场景。
 
@@ -93,6 +110,9 @@ Windows named pipe 尚未实现。Windows 必须保持显式 direct 兼容路径
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q sshbridge remote.py
 ```
+
+MCP 行为变动还必须在安装 `requirements-mcp.txt` 的 Python 3.12 隔离环境中运行
+相同测试套件。
 
 每次行为改动都应新增测试。优先添加 mock SFTP transport 或一次性 SSH 测试主机的
 操作级测试，覆盖沙箱逃逸、符号链接、原子写入、冲突检查、超时、Broker 路由、
