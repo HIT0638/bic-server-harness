@@ -14,6 +14,7 @@
 - `07-long-running-commands.md`：长命令并发、输出与取消。
 - `08-reconnect-circuit-breaker.md`：连接失败、冷却和手动恢复，已实现。
 - `09-python-go-evaluation.md`：Python 与 Go 的实现取舍。
+- `10-macos-pywebview-desktop.md`：macOS pywebview Desktop MVP。
 
 ## 共同约束
 
