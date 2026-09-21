@@ -163,6 +163,13 @@ def create_mcp_server(
         mcp_module=None,
         broker_client_factory=BrokerClient):
     """Create one profile-bound MCPServer and start its local broker."""
+    if not os.path.isabs(config_path):
+        raise BridgeError(
+            "INVALID_CONFIG", "MCP config path must be absolute")
+    if profile.connection_policy["mode"] != "broker":
+        raise BridgeError(
+            "BROKER_UNSUPPORTED",
+            "MCP requires connection_policy.mode=broker")
     sdk = _sdk_namespace(mcp_module)
     client = broker_client_factory(config_path, profile)
     client.ensure_started()

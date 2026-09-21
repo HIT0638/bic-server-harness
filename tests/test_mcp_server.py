@@ -167,6 +167,21 @@ class TestMcpCommand(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("INVALID_CONFIG", stderr.getvalue())
 
+    def test_programmatic_factory_enforces_config_and_broker_mode(self):
+        broker_profile = Profile("test", profile_raw())
+        with self.assertRaises(BridgeError) as relative:
+            mcp_server.create_mcp_server(
+                broker_profile, "bridge.json", mcp_module=object())
+        self.assertEqual(relative.exception.code, "INVALID_CONFIG")
+
+        direct_profile = Profile(
+            "test",
+            profile_raw(connection_policy={"mode": "direct"}))
+        with self.assertRaises(BridgeError) as direct:
+            mcp_server.create_mcp_server(
+                direct_profile, "/tmp/bridge.json", mcp_module=object())
+        self.assertEqual(direct.exception.code, "BROKER_UNSUPPORTED")
+
     def test_direct_profile_is_rejected_before_sdk_start(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_config(directory, mode="direct")
