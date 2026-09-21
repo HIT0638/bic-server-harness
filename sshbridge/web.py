@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import secrets
+import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +17,7 @@ from .broker_client import BrokerClient
 from .errors import BridgeError
 from .sftp_client import SftpSession, _is_connect_failure
 
-ASSET_DIR = os.path.join(os.path.dirname(__file__), "web_assets")
+PACKAGE_ASSET_DIR = os.path.join(os.path.dirname(__file__), "web_assets")
 MAX_JSON_OVERHEAD = 64 * 1024
 
 _ERROR_STATUS = {
@@ -297,7 +298,7 @@ class ExplorerHandler(BaseHTTPRequestHandler):
         }.get(path)
         if asset is None:
             return self.send_error(404)
-        asset_path = os.path.join(ASSET_DIR, asset)
+        asset_path = os.path.join(_asset_dir(), asset)
         try:
             with open(asset_path, "rb") as asset_file:
                 content = asset_file.read()
@@ -363,6 +364,22 @@ def _content_security_policy():
         "frame-ancestors 'none'")
 
 
+def _asset_dir(environ=None, frozen=None):
+    environ = os.environ if environ is None else environ
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    if frozen:
+        resource_path = environ.get("RESOURCEPATH")
+        if resource_path:
+            return os.path.join(resource_path, "web_assets")
+    return PACKAGE_ASSET_DIR
+
+
+def explorer_url(server):
+    return "http://127.0.0.1:%d/?token=%s" % (
+        server.server_address[1], server.token)
+
+
 def create_server(profile, config_path=None, port=8765, token=None):
     if not isinstance(port, int) or not (0 <= port <= 65535):
         raise BridgeError("INVALID_ARG", "port must be between 0 and 65535")
@@ -378,8 +395,7 @@ def serve(profile, config_path=None, port=8765, open_browser=True):
     except OSError as error:
         raise BridgeError(
             "INVALID_ARG", "cannot listen on 127.0.0.1:%s: %s" % (port, error))
-    actual_port = server.server_address[1]
-    url = "http://127.0.0.1:%d/?token=%s" % (actual_port, server.token)
+    url = explorer_url(server)
     print("Remote Explorer: %s" % url, flush=True)
     if open_browser:
         threading.Timer(0.2, webbrowser.open, args=(url,)).start()

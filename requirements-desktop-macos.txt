@@ -1,0 +1,10 @@
+pywebview==6.2.1
+pyobjc-core==12.2.2
+pyobjc-framework-Cocoa==12.2.2
+pyobjc-framework-Quartz==12.2.2
+pyobjc-framework-WebKit==12.2.2
+pyobjc-framework-Security==12.2.2
+pyobjc-framework-UniformTypeIdentifiers==12.2.2
+py2app==0.28.10
+setuptools==82.0.1
+wheel==0.48.0

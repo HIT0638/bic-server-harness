@@ -25,6 +25,8 @@ Node.js、新版 glibc 或 Agent Runtime。
 - ControlMaster 可用时允许两个 Exec channel 并行，且不阻塞 SFTP 文件操作。
 - 首次连接失败后进入熔断状态，只接受显式重连，不自动形成连接风暴。
 - 本地 Web Explorer 提供懒加载目录树、文本查看与编辑、新建和重命名。
+- macOS Desktop 使用 Cocoa 窗口承载同一套 Explorer，并继续复用 loopback API 与
+  Connection Broker。
 
 ## 前置条件
 
@@ -33,7 +35,8 @@ Node.js、新版 glibc 或 Agent Runtime。
 - 远端 `sshd` 已启用 SFTP 子系统。
 - 仅使用 `hash` 或 `write --expected-hash` 时，远端需要 `sha256sum`。
 
-无需第三方 Python 依赖。
+CLI、Broker 和 Web Explorer 无需第三方 Python 依赖。macOS Desktop 的可选依赖
+单独锁定在 `requirements-desktop-macos.txt`。
 
 ## 配置
 
@@ -149,6 +152,41 @@ Web 服务固定绑定 `127.0.0.1`，不能通过参数改为外网地址。API 
 生成的随机 token。浏览器只使用虚拟工作区路径，API 不返回真实远端根路径或 SSH
 凭据。关闭 `remote serve` 后 token 立即失效。
 
+## macOS Desktop
+
+Desktop MVP 使用 pywebview 的 Cocoa 窗口承载现有 Explorer。它不开放 Python
+JavaScript API，也不直接连接 SSH；文件操作仍依次经过随机 loopback 端口、token
+鉴权 Web API 和 Connection Broker。关闭窗口只释放本次 Desktop 的 HTTP server，
+不会停止共享 Broker。
+
+开发模式要求 Apple Silicon macOS、Homebrew Python 3.12 和独立虚拟环境：
+
+```sh
+brew install python@3.12
+/opt/homebrew/opt/python@3.12/bin/python3.12 -m venv .venv/desktop-macos
+.venv/desktop-macos/bin/python -m pip install \
+  -r requirements-desktop-macos.txt
+.venv/desktop-macos/bin/python remote.py --config bridge.json desktop
+```
+
+`desktop` 只支持 `connection_policy.mode=broker`，不支持 `--json`。未安装 Desktop
+依赖时，只有该命令返回 `DESKTOP_DEPENDENCY_MISSING`，基础 CLI 与 Web 不受影响。
+
+Finder 启动的 `.app` 按以下顺序发现配置：
+
+1. `SSHBRIDGE_CONFIG` 环境变量。
+2. `~/Library/Application Support/SSHBridge/bridge.json`。
+
+本机 unsigned App 的构建命令：
+
+```sh
+packaging/macos/build_app.sh
+```
+
+产物位于 `packaging/macos/dist/Remote Explorer.app`。当前 MVP 只验证本机构建环境的
+arm64 bundle，不包含 Developer ID 签名、公证、DMG、自动更新或跨机器兼容承诺。
+构建目录和 `.app` 均被 Git 忽略。
+
 ### 固定本地工作区
 
 手动开发可启动固定 localhost sshd，直接将 `only4test/` 作为远端根目录：
@@ -222,6 +260,8 @@ SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的
 - `sshbridge/daemon.py`：旧 daemon 命令的 Broker 兼容入口。
 - `sshbridge/web.py`：本地 Web/API 服务、token 鉴权和 Broker 调用。
 - `sshbridge/web_assets/`：远程目录树与文本编辑界面。
+- `sshbridge/desktop.py`：macOS Cocoa 窗口、HTTP 生命周期和桌面配置发现。
+- `packaging/macos/`：py2app 入口、bundled Broker helper 和 arm64 构建脚本。
 - `sshbridge/config.py`：profile 解析与 OpenSSH 调用选项。
 
 `ops.py` 将作为未来 MCP tools 的后端。新增传输层入口应保持轻量，并复用这些操作函数。
@@ -265,5 +305,5 @@ Git 中的原始测试文件。
 
 ## 状态
 
-CLI、Connection Broker 与 Web Explorer MVP 已实现。MCP Server、Rsync channel 和
-Windows named pipe 仍是后续工作。
+CLI、Connection Broker、Web Explorer 与 macOS Desktop MVP 已实现。MCP Server、
+Rsync channel、Windows named pipe 和可分发的签名 Desktop 安装包仍是后续工作。

@@ -373,6 +373,7 @@
   }
 
   function updateDirtyState() {
+    document.documentElement.dataset.dirty = state.dirty ? "true" : "false";
     elements.dirty.classList.toggle("active", state.dirty);
     elements.save.disabled = !state.currentFile || !state.dirty;
   }
@@ -573,5 +574,6 @@
     event.preventDefault();
   });
 
+  updateDirtyState();
   initialize();
 })();

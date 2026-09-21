@@ -8,7 +8,8 @@ import unittest
 from unittest import mock
 
 from sshbridge.broker import BrokerServer
-from sshbridge.broker_client import BrokerEndpoint, profile_fingerprint
+from sshbridge.broker_client import (
+    BrokerEndpoint, _broker_launch_argv, profile_fingerprint)
 from sshbridge.config import Profile
 from sshbridge.errors import BridgeError
 from sshbridge.exec_client import is_ssh_transport_failure
@@ -123,6 +124,58 @@ class TestBrokerEndpoint(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     BrokerEndpoint("/tmp/bridge.json", profile)
             self.assertEqual(caught.exception.code, "BROKER_UNAVAILABLE")
+
+
+class TestBrokerLauncher(unittest.TestCase):
+    def test_python_mode_uses_module_entrypoint(self):
+        argv = _broker_launch_argv(
+            "/tmp/bridge.json", "test",
+            frozen=False, executable="/usr/local/bin/python3")
+        self.assertEqual(argv[:4], [
+            "/usr/local/bin/python3", "-m", "sshbridge.broker", "--serve"])
+        self.assertEqual(argv[-4:], [
+            "--config", "/tmp/bridge.json", "--profile", "test"])
+
+    def test_frozen_mode_uses_bundled_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = os.path.join(directory, "Remote Explorer")
+            helper = os.path.join(directory, "sshbridge_broker")
+            for path in (executable, helper):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write("#!/bin/sh\n")
+                os.chmod(path, 0o700)
+            argv = _broker_launch_argv(
+                "/tmp/bridge.json", "test",
+                frozen=True, executable=executable)
+        self.assertEqual(argv[0], helper)
+        self.assertNotIn("-m", argv)
+
+    def test_frozen_mode_rejects_missing_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = os.path.join(directory, "Remote Explorer")
+            with open(executable, "w", encoding="utf-8") as stream:
+                stream.write("#!/bin/sh\n")
+            with self.assertRaises(BridgeError) as caught:
+                _broker_launch_argv(
+                    "/tmp/bridge.json", "test",
+                    frozen=True, executable=executable)
+        self.assertEqual(caught.exception.code, "BROKER_UNAVAILABLE")
+
+    def test_frozen_mode_rejects_symlink_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = os.path.join(directory, "Remote Explorer")
+            target = os.path.join(directory, "target")
+            helper = os.path.join(directory, "sshbridge_broker")
+            for path in (executable, target):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write("#!/bin/sh\n")
+                os.chmod(path, 0o700)
+            os.symlink(target, helper)
+            with self.assertRaises(BridgeError) as caught:
+                _broker_launch_argv(
+                    "/tmp/bridge.json", "test",
+                    frozen=True, executable=executable)
+        self.assertEqual(caught.exception.code, "BROKER_UNAVAILABLE")
 
 
 class TestConnectionFailureClassification(unittest.TestCase):

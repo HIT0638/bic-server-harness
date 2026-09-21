@@ -102,6 +102,10 @@ def build_parser():
     p.add_argument("--no-open", action="store_true",
                    help="do not open the browser automatically")
 
+    sub.add_parser(
+        "desktop", parents=[common],
+        help="start the macOS desktop file explorer")
+
     p = sub.add_parser(
         "broker", parents=[common],
         help="manage the per-profile local connection broker")
@@ -328,7 +332,13 @@ def main(argv=None):
         broker_client = None
         if profile.connection_policy["mode"] == "broker":
             broker_client = BrokerClient(cfg["file"], profile)
-        if args.op == "serve":
+        if args.op == "desktop":
+            if args.json:
+                raise BridgeError(
+                    "INVALID_ARG", "--json is not supported with desktop")
+            from .desktop import run_desktop
+            return run_desktop(profile, cfg["file"])
+        elif args.op == "serve":
             if args.json:
                 raise BridgeError(
                     "INVALID_ARG", "--json is not supported with serve")

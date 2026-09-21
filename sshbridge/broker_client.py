@@ -246,12 +246,11 @@ class BrokerClient:
             if error.code not in ("BROKER_UNAVAILABLE",
                                   "BROKER_PROFILE_MISMATCH"):
                 raise
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        argv = [
-            sys.executable, "-m", "sshbridge.broker", "--serve", "--detach",
-            "--config", self.config_path,
-            "--profile", self.profile.name,
-        ]
+        frozen = bool(getattr(sys, "frozen", False))
+        argv = _broker_launch_argv(
+            self.config_path, self.profile.name, frozen=frozen)
+        root = None if frozen else \
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         kwargs = {}
         if os.name != "nt":
             kwargs["start_new_session"] = True
@@ -333,6 +332,35 @@ def _read_message(connection):
             raise BridgeError(
                 "BROKER_UNAVAILABLE", "broker response is too large")
     return bytes(buffer)
+
+
+def _broker_launch_argv(
+        config_path, profile_name, frozen=None, executable=None):
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    executable = os.path.abspath(executable or sys.executable)
+    if frozen:
+        helper = os.path.join(
+            os.path.dirname(executable), "sshbridge_broker")
+        try:
+            info = os.lstat(helper)
+        except OSError as error:
+            raise BridgeError(
+                "BROKER_UNAVAILABLE",
+                "bundled broker helper is unavailable: %s" % error)
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) \
+                or not os.access(helper, os.X_OK):
+            raise BridgeError(
+                "BROKER_UNAVAILABLE",
+                "bundled broker helper is not an executable regular file")
+        command = [helper]
+    else:
+        command = [executable, "-m", "sshbridge.broker"]
+    return command + [
+        "--serve", "--detach",
+        "--config", os.path.abspath(config_path),
+        "--profile", profile_name,
+    ]
 
 
 def _reap_launcher(process):

@@ -2,8 +2,12 @@
 
 ## 状态
 
-当前未实现。本草案定义 macOS 首期 Desktop MVP；Windows、Linux、签名公证、自动
-更新和原生控件重写不在本期范围。
+macOS 首期 Desktop MVP 已实现并完成本机 arm64 构建验证。Windows、Linux、
+Developer ID 签名、公证、自动更新和原生控件重写不在本期范围。
+
+- 设计提交：`95b29e1`。
+- 实现提交：待实现提交完成后补录。
+- App 版本：`0.1.0`。
 
 ## 背景
 
@@ -20,46 +24,66 @@ pywebview 在 macOS 使用 Cocoa WebView，并要求 GUI loop 运行在主线程
 
 ## 当前实现
 
-当前未实现 pywebview Desktop 入口、`.app` 打包和桌面配置发现。
-
-`sshbridge/web.py::create_server` 已支持随机 loopback 端口、随机 token 和
-Broker-backed `WorkspaceService`：
+`sshbridge/desktop.py::run_desktop` 已实现 Desktop 生命周期：
 
 ```python
-def create_server(profile, config_path=None, port=8765, token=None):
-    if not isinstance(port, int) or not (0 <= port <= 65535):
-        raise BridgeError("INVALID_ARG", "port must be between 0 and 65535")
-    return ExplorerHTTPServer(
-        ("127.0.0.1", port), profile, token or secrets.token_urlsafe(24),
-        config_path=config_path)
+server = server_factory(profile, config_path=config_path, port=0)
+thread = threading.Thread(
+    target=server.serve_forever,
+    kwargs={"poll_interval": 0.2},
+    name="sshbridge-desktop-http")
+thread.start()
+window = webview_module.create_window(
+    "%s - %s" % (APP_NAME, profile.name),
+    explorer_url(server),
+    width=DEFAULT_WIDTH,
+    height=DEFAULT_HEIGHT,
+    min_size=(MIN_WIDTH, MIN_HEIGHT),
+    resizable=True,
+    zoomable=False,
+    draggable=False)
+window.events.closing += _confirm_close
+webview_module.start(private_mode=True)
 ```
 
-`sshbridge/web.py::serve` 当前将 token URL 交给系统浏览器：
+GUI loop 正常退出或异常时都会执行 `shutdown`、`server_close` 和最长 5 秒的线程
+join。Desktop 不调用 Broker stop。未保存状态由前端同步到
+`document.documentElement.dataset.dirty`，关闭事件通过 pywebview `run_js` 读取；
+该 API 不依赖 `eval`，因此无需放宽现有 CSP。
+
+`sshbridge/web.py` 继续提供随机 loopback 端口、随机 token、CSP 和
+Broker-backed `WorkspaceService`。浏览器入口与 Desktop 共用 `explorer_url`：
 
 ```python
-actual_port = server.server_address[1]
-url = "http://127.0.0.1:%d/?token=%s" % (actual_port, server.token)
-print("Remote Explorer: %s" % url, flush=True)
-if open_browser:
-    threading.Timer(0.2, webbrowser.open, args=(url,)).start()
+def explorer_url(server):
+    return "http://127.0.0.1:%d/?token=%s" % (
+        server.server_address[1], server.token)
 ```
 
-`sshbridge/web.py::WorkspaceService` 已保证 Web UI 在 broker 模式下不直接创建 SSH：
+Desktop 不输出 token URL，也不暴露 `window.pywebview.api`。frozen 模式从
+`RESOURCEPATH/web_assets` 加载固定白名单中的 `index.html`、`app.js` 和
+`styles.css`。
 
-```python
-if profile.connection_policy["mode"] == "broker":
-    if not config_path:
-        raise BridgeError(
-            "INVALID_CONFIG",
-            "config_path is required for broker-backed Web Explorer")
-    self._broker = BrokerClient(config_path, profile)
-    self._broker.ensure_started()
+开发入口已加入 `sshbridge/cli.py`：
+
+```text
+python3 remote.py --config bridge.json desktop
 ```
 
-浏览器前端收到 token 后将其写入 `sessionStorage`，并从地址栏移除 query。Desktop
-MVP 可以复用该行为，无需新增认证协议。
+该入口只接受 broker profile，不支持 `--json`。pywebview 保持懒加载，未安装依赖时
+返回 `DESKTOP_DEPENDENCY_MISSING`，不影响其他命令。
 
-## 痛点
+`resolve_desktop_config_path` 在普通 CLI 中保持 `./bridge.json` 语义；frozen App
+依次读取 `SSHBRIDGE_CONFIG` 和
+`~/Library/Application Support/SSHBridge/bridge.json`。配置错误使用转义后的
+只读 HTML 错误窗口显示，不启动 Explorer HTTP server。
+
+py2app bundle 包含独立 `Contents/MacOS/sshbridge_broker`。frozen
+`BrokerClient.ensure_started` 只允许启动同目录的可执行普通文件；helper 缺失、
+为符号链接或不可执行时返回 `BROKER_UNAVAILABLE`，不回退 direct 或 App launcher
+的 `-m` 模式。
+
+## 实施前痛点
 
 - `remote serve` 会打开系统浏览器，不具备独立应用窗口和 Dock 身份。
 - 浏览器标签页关闭与本地 HTTP server 生命周期没有直接绑定。
@@ -158,7 +182,7 @@ remote desktop
 首期沿用全局 `--config` 和 `--profile`。`desktop` 不支持 `--json`，也不接受监听
 地址；HTTP server 固定使用 `127.0.0.1` 和随机端口。
 
-建议新增稳定错误：
+已新增稳定错误：
 
 - `DESKTOP_DEPENDENCY_MISSING`：未安装 pywebview/macOS Cocoa 依赖。
 - `DESKTOP_UNSUPPORTED`：当前平台不是 macOS。
@@ -201,44 +225,56 @@ Finder 启动的 `.app` 没有可靠项目工作目录。打包模式按以下�
 MVP 不提供配置编辑器。配置不存在或无效时显示启动错误，并明确给出预期路径；不得
 在 app bundle 内写入或携带真实 profile、SSH 参数或凭据。
 
-打包前应增加纯函数处理配置路径解析，并单独测试 CLI 与 app bundle 两种上下文。
+配置路径由纯函数处理，并已单独测试 CLI 与 app bundle 两种上下文。
 
 ### 6. 可选依赖
 
-基础安装继续保持零第三方依赖。Desktop 依赖单独记录，例如：
+基础安装继续保持零第三方依赖。Desktop 依赖已锁定为：
 
 ```text
-pywebview
-pyobjc-core
-pyobjc-framework-Cocoa
-pyobjc-framework-Quartz
-pyobjc-framework-WebKit
-pyobjc-framework-security
+pywebview==6.2.1
+pyobjc-core==12.2.2
+pyobjc-framework-Cocoa==12.2.2
+pyobjc-framework-Quartz==12.2.2
+pyobjc-framework-WebKit==12.2.2
+pyobjc-framework-Security==12.2.2
+pyobjc-framework-UniformTypeIdentifiers==12.2.2
+py2app==0.28.10
+setuptools==82.0.1
+wheel==0.48.0
 ```
 
-具体版本在实施时锁定并验证，不在草案中预设。开发环境不得依赖 macOS 系统 Python
-隐式提供 PyObjC；使用独立虚拟环境验证，避免键盘焦点和 Cmd+Tab 行为受 Python
-来源影响。
+构建使用 Homebrew Python `3.12.14` 和仓库内被忽略的
+`.venv/desktop-macos`，不依赖 macOS Apple Python 隐式提供的 PyObjC。
 
 ### 7. 打包
 
-MVP 分两步交付：
+MVP 已交付两个入口：
 
 1. 开发入口：在虚拟环境安装可选依赖后运行 `remote desktop`。
 2. 本机 unsigned `.app`：使用 py2app 构建，包含 Python、pywebview、PyObjC、
    `sshbridge/web_assets/` 和必要模块。
 
-建议新增：
+已新增：
 
 ```text
 requirements-desktop-macos.txt
+packaging/macos/desktop_app.py
+packaging/macos/sshbridge_broker.py
 packaging/macos/setup.py
 packaging/macos/build_app.sh
 tests/test_desktop.py
 ```
 
-构建脚本必须从干净虚拟环境执行，避免把 Qt、测试工具或无关包带入 app bundle。
-`.app`、build/dist 目录和本机签名产物不得提交。
+`build_app.sh` 限制在 Darwin arm64 上使用 Homebrew Python 3.12，重建隔离虚拟环境，
+清理 `packaging/macos/build` 与 `dist` 后执行 standalone py2app 构建，并验证主
+launcher、Broker helper 与三项 Web 资源。`.app`、build/dist 目录和本机签名产物
+均由 Git 忽略。
+
+冻结 App 不能使用 `sys.executable -m sshbridge.broker`，因为
+`sys.executable` 是 App launcher。`extra_scripts` 将独立 Broker 入口放入
+`Contents/MacOS/sshbridge_broker`，与普通 Python 模式保持同一 Broker 协议和
+连接治理。
 
 本期 unsigned `.app` 只作为本机验证产物。对其他机器分发前必须另行完成：
 
@@ -272,15 +308,14 @@ pywebview window API 增加，不改变 Broker 协议。
 - 远端连接失败：窗口保持打开，沿用现有“连接已暂停”和显式重连。
 - 窗口关闭：停止 HTTP server，不停止 Broker，不删除或修改远端文件。
 
-## 实施步骤
+## 实施记录
 
-1. 抽取可复用的 Explorer server 生命周期 helper，保持 `serve` 行为不变。
-2. 新增 `sshbridge/desktop.py` 和 `remote desktop`。
-3. 使用假的 webview/server 增加无 GUI 单元测试。
-4. 在 macOS 虚拟环境中验证 Cocoa 窗口、键盘和关闭清理。
-5. 增加 py2app 配置和干净环境构建脚本。
-6. 从 Finder 启动 unsigned `.app`，验证配置发现和资源加载。
-7. 更新 `README.md`、`AGENTS.md` 和 `.gitignore`。
+1. 抽取 `explorer_url` 和 frozen 资源解析，保持 `serve` 行为不变。
+2. 新增 `sshbridge/desktop.py`、`remote desktop` 和生命周期测试。
+3. 增加 bundled Broker helper 及 frozen 启动路径安全校验。
+4. 使用 Homebrew Python 3.12 安装锁定依赖并完成 py2app standalone 构建。
+5. 使用真实 Cocoa、冻结 App、本地 OpenSSH 和 WebKit 快照完成本机验证。
+6. 更新 `README.md`、`AGENTS.md`、`.gitignore` 和设计记录。
 
 ## 测试
 
@@ -315,6 +350,25 @@ pywebview window API 增加，不改变 Broker 协议。
 - Activity Monitor 和 `lsof` 显示一个 Desktop HTTP listener、一个 Broker 和一个
   ControlMaster TCP。
 - 从 Finder 启动 unsigned `.app` 后，静态资源和用户配置可找到。
+
+### 实际验证结果
+
+- Apple Python `3.9.6` 与 Homebrew Python `3.12.14` 均通过完整 84 项测试。
+- `python3 -m compileall`、`node --check sshbridge/web_assets/app.js` 与
+  `git diff --check` 通过。
+- 开发入口已启动真实 Cocoa 窗口；页面完成加载，未保存标记在编辑后由 `false`
+  变为 `true`。
+- frozen App 已启动真实 Cocoa 进程，加载 bundle 内 Web 资源，并由
+  `Contents/MacOS/sshbridge_broker` 启动 Broker。
+- frozen 运行中 Broker 达到 `READY`，`tcp_generation=1`，本地 OpenSSH 观测为
+  单个复用 TCP。
+- WebKit 首屏与未保存编辑状态快照已人工检查，桌面和移动尺寸未发现空白、裁切或
+  控件重叠。
+- 本机构建产物约 42 MB；主 launcher 为 arm64 Mach-O，Info.plist、bundled helper、
+  Web 资源和 ad-hoc code signature 校验通过。
+
+系统屏幕录制权限未开放，因此视觉检查使用 WebKit 页面快照完成。未执行
+Developer ID 签名、公证、DMG、跨机器启动和非 arm64 验证。
 
 ## 验收标准
 

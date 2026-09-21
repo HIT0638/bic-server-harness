@@ -20,6 +20,21 @@ glibc 2.17 的老旧 Linux 服务器；只假定远端存在 OpenSSH、SFTP 与 
 - Web Explorer 必须固定监听 loopback，API 必须使用随机 token 鉴权。
 - Web API 只返回虚拟工作区路径，不得暴露真实远端根路径、SSH 参数或凭据。
 - Web 前端不得直接连接 SSH；所有文件操作必须通过本地 API 和 `sshbridge/ops.py`。
+- Desktop 必须复用同一 loopback Web API 和 Connection Broker，不得通过
+  pywebview JavaScript bridge 或 Desktop 进程增加第二套文件操作路径。
+
+## Desktop 规则
+
+- pywebview、PyObjC 和 py2app 必须保持为 macOS 隔离可选依赖，不得让基础 CLI、
+  Broker、Web 或测试依赖第三方 Python 包。
+- Desktop 只支持 `broker` mode；Broker 不可用时不得隐藏回退 direct。
+- py2app frozen 进程必须通过 App bundle 中同目录的 `sshbridge_broker` helper
+  启动 Broker。helper 缺失、为符号链接、非普通文件或不可执行时必须失败。
+- App bundle 不得包含 `bridge.json`、真实 profile、SSH 参数或凭据。Finder 启动时
+  只允许通过 `SSHBRIDGE_CONFIG` 或用户 Application Support 目录发现配置。
+- Desktop 关闭时必须释放自身 HTTP listener 和线程，但不得停止共享 Broker。
+- 不得为了 Python 侧执行 JavaScript 而放宽现有 CSP；未保存状态读取使用不依赖
+  `eval` 的窗口 API。
 
 ## 文件系统安全
 
@@ -99,4 +114,5 @@ OpenSSH 工具存在但行为回归时必须测试失败。
 - `bridge.json` 必须保留本地；只跟踪 `bridge.example.json`。
 - 不得提交 SSH 私钥、SSH 配置、主机专属凭据、Broker 状态文件、日志、字节码或
   虚拟环境。
+- 不得提交 macOS Desktop 的 `build/`、`dist/`、`.app` 或本机签名产物。
 - 文档必须保持事实准确。命令语法、安全边界、配置或支持操作变化时，更新 `README.md`。

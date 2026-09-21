@@ -2,13 +2,17 @@ import errno
 import json
 import os
 import socket
+import sys
+import tempfile
 import threading
 import unittest
+from pathlib import Path
+from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from sshbridge.config import Profile
-from sshbridge.web import create_server
+from sshbridge.web import _asset_dir, create_server, explorer_url
 
 from tests.local_sshd import LocalSshd, LocalSshdUnavailable
 
@@ -100,6 +104,25 @@ class TestWebExplorerIntegration(unittest.TestCase):
         self.assertEqual(payload["profile"], "local-test")
         self.assertEqual(payload["workspace_root"], "/")
         self.assertNotIn("root", payload)
+
+    def test_explorer_url_uses_bound_port_and_token(self):
+        self.assertEqual(
+            explorer_url(self.web),
+            self.base_url + "/?token=test-token")
+
+    def test_frozen_asset_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory) / "web_assets"
+            assets.mkdir()
+            (assets / "index.html").write_text(
+                "bundled explorer", encoding="utf-8")
+            with mock.patch.object(sys, "frozen", True, create=True), \
+                    mock.patch.dict(
+                        os.environ, {"RESOURCEPATH": directory}, clear=False):
+                self.assertEqual(_asset_dir(), str(assets))
+                status, _, raw = self.request("/", token=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, b"bundled explorer")
 
     def test_occupied_port_preserves_bind_error(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
