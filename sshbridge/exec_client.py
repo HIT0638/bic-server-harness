@@ -30,6 +30,23 @@ def _is_pre_auth_failure(stderr_text):
     return any(m in t for m in _PRE_AUTH_MARKERS)
 
 
+def is_ssh_transport_failure(stderr_text):
+    if _is_pre_auth_failure(stderr_text):
+        return True
+    if isinstance(stderr_text, bytes):
+        stderr_text = _decode(stderr_text)
+    text = (stderr_text or "").lower()
+    markers = (
+        "permission denied",
+        "host key verification failed",
+        "remote host identification has changed",
+        "too many authentication failures",
+        "control socket connect",
+        "mux_client_request_session",
+    )
+    return any(marker in text for marker in markers)
+
+
 def run_exec(profile, command, cwd, timeout, connect_retries=2, retry_delay=3.0):
     """Run `command` on the remote host with cwd as working directory.
 

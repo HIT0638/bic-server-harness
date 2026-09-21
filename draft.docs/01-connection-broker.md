@@ -1,117 +1,126 @@
 # 单 Profile Connection Broker
 
+## 状态
+
+已在 `feat/connection-broker` 分支实现。覆盖 macOS/Linux；Windows named pipe、
+MCP 和 Rsync 不在本期范围。
+
 ## 背景
 
-正式环境只使用一个 profile，并连接一台远端服务器。该服务器会对短时间内频繁建立
-SSH 连接的来源 IP 实施封禁。当前 CLI、Web、daemon 和未来 MCP 都可能独立创建
-OpenSSH 进程。
-
-SSH TCP 连接与 SSH channel 是不同资源。一个持久 SSH TCP 可以承载 SFTP、命令执行
-和其他子系统 channel。连接治理应限制 TCP 握手，而不是把所有业务操作强制串行。
+正式环境可能对短时间内频繁建立 SSH 连接的来源 IP 实施封禁。SSH TCP 连接与 SSH
+channel 是不同资源：一个持久 TCP 可以承载 SFTP 和多个命令 channel，因此连接治理
+应限制 TCP 握手，而不是把所有操作串行化。
 
 ## 当前实现
 
-`sshbridge/ops.py::_maybe_session` 在调用方未提供 session 时，每次操作都会创建新的
-SFTP 连接：
+`sshbridge/config.py::CONNECTION_POLICY_DEFAULTS` 默认在 POSIX 启用 Broker：
 
 ```python
-@contextmanager
-def _maybe_session(profile, session):
-    if session is None:
-        with _session(profile) as s:
-            yield s
-    else:
-        yield session
+CONNECTION_POLICY_DEFAULTS = {
+    "mode": "direct" if sys.platform == "win32" else "broker",
+    "exec_concurrency": 2,
+    "min_connect_interval": 10,
+    "connect_retries": 0,
+    "auto_reconnect": False,
+    "cooldown_initial": 60,
+    "cooldown_max": 1800,
+    "control_master": sys.platform != "win32",
+}
 ```
 
-`sshbridge/daemon.py::_run_op` 会复用一个 SFTP session，但所有操作共用同一把锁：
+`sshbridge/broker.py::BrokerState` 分离连接、SFTP 和 Exec 并发控制：
 
 ```python
-with state["lock"]:
-    if state["session"] is None or state["session"]._closed:
-        state["session"] = SftpSession(
-            profile.sftp_argv(), profile.op_timeout)
-    return _dispatch(profile, op, args, state["session"])
+self.exec_semaphore = threading.BoundedSemaphore(self.exec_limit)
+self.connect_lock = threading.RLock()
+self.sftp_lock = threading.Lock()
+self.state_lock = threading.Lock()
 ```
 
-`sshbridge/web.py::WorkspaceService` 也持有自己的 SFTP session，因此 Web 与 daemon
-同时运行时仍会建立两条独立连接。当前没有跨进程的唯一连接所有者。
+`sshbridge/transport.py::OpenSSHTransport` 启动一个 ControlMaster。其
+`channel_profile` 为 SFTP 和 Exec 显式配置同一个 ControlPath：
+
+```python
+self.channel_profile = copy.copy(profile)
+if self.multiplexing:
+    self.channel_profile.control_path = control_path
+```
+
+Broker 创建 SFTP 和执行 Exec 时分别显式传入 `connect_retries=0`。
+
+CLI 在 broker 模式下先自动启动本地 Broker，再通过 Unix socket 发送请求。启动失败
+会返回 `BROKER_UNAVAILABLE`，不会调用 direct 路径。Web Explorer 使用同一
+`BrokerClient`，不再持有独立 SFTP 连接。旧 `daemon` 命令只保留为 Broker 的弃用
+别名，不再监听 localhost TCP。
 
 ## 痛点
 
-- CLI 找不到 daemon 时会回退到直接连接。
-- Web Explorer 持有自己的 SFTP 连接。
-- daemon 持有另一条 SFTP 连接。
-- 每次 `exec` 都会启动一个 `ssh` 进程；没有 ControlMaster 时会建立新 TCP。
-- 多个调用方无法共享失败状态、冷却时间和连接计数。
-- 当前 daemon 的全局锁覆盖所有操作，长命令可能阻塞文件操作。
+实施前 CLI、Web 和 daemon 可分别建立 SSH，Exec 也可能为每条命令建立新 TCP。
+失败状态和连接频率无法跨进程共享，全局 daemon 锁还会让长命令阻塞文件操作。
 
 ## 目标
 
-- 每个 profile 在本机只有一个连接所有者。
-- 常态保持一个 SSH TCP，最多允许少量受控连接。
-- 文件操作和命令执行使用独立队列，不互相持有业务锁。
-- 所有重连经过统一频率限制和熔断逻辑。
-- 保护模式下禁止调用方绕过 broker 直连。
-- 为 CLI、Web 和 MCP 提供相同的本地调用协议。
+- 每个 profile 只有一个连接所有者。
+- 常态由一个 SSH TCP 承载 SFTP 与少量并行 Exec channel。
+- SFTP 和 Exec 使用独立并发控制。
+- Broker 不可用或连接熔断时禁止隐藏直连。
+- CLI、Web 和后续 MCP 使用同一本地协议与操作语义。
 
 ## 预期
 
-- 高频目录浏览和小文件编辑不增加 SSH TCP 握手。
-- 两个长命令可以并行运行，同时目录浏览继续响应。
-- 网络异常不会形成多个进程同时重连的连接风暴。
-- broker 状态可观测，包括 TCP 状态、channel 数、队列长度、失败次数和冷却时间。
-- broker 重启只影响短期可用性，不改变远端文件语义。
+- 高频目录浏览和小文件编辑不增加 SSH TCP generation。
+- 两个命令可并行，同时目录读取继续响应。
+- 多客户端共享失败状态、冷却时间和连接统计。
+- 网络或认证故障不会触发自动重连风暴。
 
 ## 方案
 
-### 单实例
+当前方案由 `BrokerClient`、Unix socket `BrokerServer`、`OpenSSHTransport` 和保持
+传输层无关的 `ops.py` 组成。profile fingerprint 与 `flock` 保证实例隔离；
+ControlMaster 负责 TCP 复用；SFTP lock、Exec semaphore 和连接锁分别管理不同资源。
 
-- broker 以 profile 名生成本地 endpoint 和进程锁。
-- POSIX 使用权限为 `0600` 的 Unix socket。
-- Windows 使用带当前用户 ACL 的 named pipe；无法实现时使用随机 token 的 loopback。
-- 第二个 broker 检测到已有实例后直接复用，不再创建连接。
+## 已知限制
 
-### OpenSSH Transport
+- Windows 仅保留 `direct` 模式；named pipe 尚未实现。
+- ControlMaster 不可用时，Exec 必须建立独立 TCP，因此降为单并发并受最小间隔限制。
+- Broker 不实现命令级路径沙箱，也不保证本地 SSH 超时会终止远端进程。
+- Exec 仍一次性缓冲 stdout/stderr；流式长命令属于后续设计。
+- `direct` 模式不提供跨进程连接治理，只适用于诊断和兼容。
 
-- POSIX 启动一个受 broker 管理的 OpenSSH ControlMaster。
-- SFTP 使用一个长期存在的 subsystem channel。
-- Exec 默认允许两个并发 channel，但不创建额外 TCP。
-- 可选 Rsync 通过同一个 ControlPath 打开传输 channel。
-- ControlMaster 不可用时，SFTP 保持一条 TCP，Exec 新建连接必须经过连接门控。
-
-### 队列
-
-- SFTP 队列并发为 1，匹配当前顺序 SFTP v3 客户端。
-- Exec 使用独立 semaphore，默认并发为 2。
-- Rsync 使用独立 semaphore，默认并发为 1。
-- 队列等待不占用连接创建配额。
-- 大文件传输只与其他 channel 共享网络带宽，不占用 SFTP 操作锁。
-
-### 保护模式
-
-建议 profile 配置：
+## 配置
 
 ```json
 {
   "connection_policy": {
-    "protected": true,
-    "require_broker": true,
+    "mode": "broker",
     "exec_concurrency": 2,
-    "rsync_concurrency": 1,
     "min_connect_interval": 10,
-    "connect_retries": 0
+    "connect_retries": 0,
+    "auto_reconnect": false,
+    "cooldown_initial": 60,
+    "cooldown_max": 1800,
+    "control_master": true
   }
 }
 ```
 
-`require_broker=true` 时，CLI、Web 和 MCP 无法连接 broker 就立即失败，不回退到直连。
+## 操作
 
-## 验收标准
+```sh
+remote broker start
+remote broker status
+remote broker reconnect
+remote broker stop
+```
 
-- 并发执行 100 次 `list_dir` 只产生一个 SSH TCP。
-- 两个长命令并行时，SFTP 操作仍可完成。
-- 同一 profile 不能启动两个连接所有者。
-- broker 不可用时，保护模式不创建直连 SSH 进程。
-- 状态接口能区分 TCP、SFTP channel、Exec channel 和排队请求。
-- 网络故障测试中，连接尝试频率不超过配置上限。
+`start` 只启动本地 Broker。远端连接由首个业务请求懒创建。`reconnect` 每次只执行
+一次受连接门控限制的尝试。
+
+## 验收结果
+
+- 100 次 `list_dir` 后 `tcp_generation` 保持为 1。
+- 两个长 Exec 并行时第三个进入队列，SFTP 请求仍可完成。
+- ControlMaster 退出后业务请求进入 `CONNECTION_PAUSED`。
+- 显式 reconnect 恢复连接并只增加一代 TCP。
+- 坏端口首次连接失败后，后续请求不产生新连接尝试。
+- CLI、Web、daemon 兼容入口和真实 OpenSSH/SFTP 流程均有集成测试。

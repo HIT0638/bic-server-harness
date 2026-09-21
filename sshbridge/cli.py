@@ -4,15 +4,11 @@ import argparse
 import base64
 import datetime
 import json
-import os
-import socket
-import subprocess
 import sys
-import time
 
 from . import ops
-from .config import DEFAULT_PORT, Profile, load_config
-from .daemon import _pidfile_path
+from .broker_client import BrokerClient
+from .config import Profile, load_config
 from .errors import BridgeError
 
 
@@ -106,14 +102,29 @@ def build_parser():
     p.add_argument("--no-open", action="store_true",
                    help="do not open the browser automatically")
 
-    p = sub.add_parser("daemon", parents=[common],
-                       help="manage the local connection-reuse daemon "
-                            "(one persistent SFTP session for all file ops)")
+    p = sub.add_parser(
+        "broker", parents=[common],
+        help="manage the per-profile local connection broker")
+    bsub = p.add_subparsers(dest="broker_cmd")
+    bsub.required = True
+    bsub.add_parser("start", parents=[common], help="start the broker")
+    bsub.add_parser("stop", parents=[common], help="stop the broker")
+    bsub.add_parser("status", parents=[common], help="show broker status")
+    bsub.add_parser(
+        "reconnect", parents=[common],
+        help="explicitly retry a paused remote connection")
+
+    p = sub.add_parser(
+        "daemon", parents=[common],
+        help="deprecated alias for broker management")
     dsub = p.add_subparsers(dest="daemon_cmd")
     dsub.required = True
-    dsub.add_parser("start", parents=[common], help="start the daemon")
-    dsub.add_parser("stop", parents=[common], help="stop the daemon")
-    dsub.add_parser("status", parents=[common], help="show daemon status")
+    dsub.add_parser("start", parents=[common], help="start the broker")
+    dsub.add_parser("stop", parents=[common], help="stop the broker")
+    dsub.add_parser("status", parents=[common], help="show broker status")
+    dsub.add_parser(
+        "reconnect", parents=[common],
+        help="explicitly retry a paused remote connection")
 
     return ap
 
@@ -166,167 +177,89 @@ def dispatch(args, profile):
     raise BridgeError("INVALID_ARG", "unknown command: %s" % op)
 
 
-# -- daemon routing ------------------------------------------------------------
+# -- broker routing -----------------------------------------------------------
 
 
-def _daemon_request(port, request, timeout=120.0):
-    s = socket.create_connection(("127.0.0.1", port), timeout=2.0)
-    try:
-        s.settimeout(timeout)
-        s.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
-        buf = bytearray()
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(1 << 16)
-            if not chunk:
-                raise ConnectionError("daemon closed connection unexpectedly")
-            buf += chunk
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-    return json.loads(bytes(buf).decode("utf-8"))
-
-
-def _daemon_build_request(args, profile):
-    """Map CLI args to a daemon request; returns (request, client_timeout)."""
+def _broker_build_request(args, profile):
+    """Map CLI args to a broker request; returns (op, args, timeout)."""
     op = args.op
     if op == "ls":
-        return {"op": "list_dir", "args": {"path": args.path}}, 120
+        return "list_dir", {"path": args.path}, 120
     if op == "stat":
-        return {"op": "stat", "args": {"path": args.path}}, 120
+        return "stat", {"path": args.path}, 120
     if op == "read":
-        return {"op": "read_file",
-                "args": {"path": args.path, "offset": args.offset,
-                         "limit": args.limit}}, 300
+        return (
+            "read_file",
+            {"path": args.path, "offset": args.offset, "limit": args.limit},
+            300)
     if op == "write":
         data = _gather_write_data(args)
-        return {"op": "write_file",
-                "args": {"path": args.path,
-                         "data_b64": base64.b64encode(data).decode("ascii"),
-                         "expected_mtime": args.expected_mtime,
-                         "expected_size": args.expected_size,
-                         "expected_hash": args.expected_hash,
-                         "force": args.force}}, 300
+        return (
+            "write_file",
+            {
+                "path": args.path,
+                "data_b64": base64.b64encode(data).decode("ascii"),
+                "expected_mtime": args.expected_mtime,
+                "expected_size": args.expected_size,
+                "expected_hash": args.expected_hash,
+                "force": args.force,
+            },
+            300)
     if op == "mkdir":
-        return {"op": "mkdir",
-                "args": {"path": args.path, "parents": args.parents}}, 120
+        return "mkdir", {"path": args.path, "parents": args.parents}, 120
     if op == "mv":
-        return {"op": "move",
-                "args": {"src": args.src, "dst": args.dst,
-                         "force": args.force}}, 120
+        return (
+            "move",
+            {"src": args.src, "dst": args.dst, "force": args.force},
+            120)
     if op == "exec":
         t = args.timeout or profile.exec_timeout
-        return {"op": "exec",
-                "args": {"command": _exec_command_text(args),
-                         "cwd": args.cwd, "timeout": args.timeout}}, t + 60
+        return (
+            "exec",
+            {
+                "command": _exec_command_text(args),
+                "cwd": args.cwd,
+                "timeout": args.timeout,
+            },
+            t + 60)
     if op == "hash":
-        return {"op": "hash", "args": {"path": args.path}}, 300
+        return "hash", {"path": args.path}, 300
     raise BridgeError("INVALID_ARG", "op not routable: %s" % op)
 
 
-def _try_daemon(port, pname, args, profile):
-    """Route through the local daemon if it is up and serves this profile.
-
-    Returns (result, raw) on success, or None when the daemon is not usable
-    (the caller falls back to direct mode). Daemon-side op errors raise
-    BridgeError - no silent retries (a write may already have happened).
-    """
-    try:
-        pong = _daemon_request(port, {"op": "ping"}, timeout=2.0)
-    except (ConnectionError, OSError, ValueError):
-        return None
-    if not pong.get("ok") or pong.get("result", {}).get("profile") != pname:
-        return None
-    req, timeout = _daemon_build_request(args, profile)
-    resp = _daemon_request(port, req, timeout=timeout)
-    if not resp.get("ok"):
-        e = resp.get("error", {})
-        raise BridgeError(e.get("code", "INTERNAL"),
-                          e.get("message", "daemon error"),
-                          **(e.get("details") or {}))
-    result = resp["result"]
+def _broker_dispatch(client, args, profile):
+    client.ensure_started()
+    operation, arguments, timeout = _broker_build_request(args, profile)
+    result = client.request(operation, arguments, timeout=timeout)
     raw = base64.b64decode(result["content_b64"]) if args.op == "read" else None
     return result, raw
 
 
-def _daemon_mgmt(args, cfg, pname):
-    port = cfg.get("daemon_port", DEFAULT_PORT)
-    cmd = args.daemon_cmd
+def _broker_mgmt(args, client):
+    cmd = args.broker_cmd if args.op == "broker" else args.daemon_cmd
     if cmd == "status":
-        try:
-            pong = _daemon_request(port, {"op": "ping"}, timeout=2.0)
-            r = pong.get("result", {}) if pong.get("ok") else {}
-            return {"action": "status", "running": True, "port": port,
-                    "profile": r.get("profile"), "pid": r.get("pid"),
-                    "uptime_s": r.get("uptime_s"),
-                    "ops_served": r.get("ops_served"),
-                    "sftp_alive": r.get("sftp_alive")}, None
-        except (ConnectionError, OSError, ValueError):
-            return {"action": "status", "running": False, "port": port}, None
-
+        result = client.status()
+        result["action"] = "status"
+        return result, None
     if cmd == "start":
-        try:
-            pong = _daemon_request(port, {"op": "ping"}, timeout=1.5)
-            if pong.get("ok"):
-                r = pong.get("result", {})
-                return {"action": "start", "already_running": True,
-                        "port": port, "profile": r.get("profile"),
-                        "pid": r.get("pid")}, None
-        except (ConnectionError, OSError, ValueError):
-            pass
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        argv = [sys.executable, "-m", "sshbridge.daemon", "--serve",
-                "--config", os.path.abspath(cfg["file"]),
-                "--profile", pname, "--port", str(port)]
-        kwargs = {}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
-                                       | subprocess.DETACHED_PROCESS)
-        subprocess.Popen(argv, cwd=root, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, **kwargs)
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            time.sleep(0.5)
-            try:
-                pong = _daemon_request(port, {"op": "ping"}, timeout=1.0)
-                if pong.get("ok"):
-                    r = pong.get("result", {})
-                    return {"action": "start", "started": True, "port": port,
-                            "profile": r.get("profile"),
-                            "pid": r.get("pid")}, None
-            except (ConnectionError, OSError, ValueError):
-                continue
-        raise BridgeError("SSH_ERROR",
-                          "daemon did not come up within 30s "
-                          "(see .bridge-daemon.log)")
-
+        was_running = client.status()["running"]
+        result = client.ensure_started()
+        result.update({
+            "action": "start",
+            "started": not was_running,
+            "already_running": was_running,
+        })
+        return result, None
     if cmd == "stop":
-        try:
-            _daemon_request(port, {"op": "shutdown"}, timeout=5.0)
-            time.sleep(0.5)
-            return {"action": "stop", "stopped": True, "port": port}, None
-        except (ConnectionError, OSError, ValueError):
-            pass
-        note = "not running"
-        try:
-            with open(_pidfile_path(), "r", encoding="utf-8") as f:
-                info = json.load(f)
-            pid = info.get("pid")
-            if pid:
-                try:
-                    os.kill(pid, 9)
-                    note = "killed stale pid %s" % pid
-                except OSError:
-                    pass
-            os.remove(_pidfile_path())
-        except (OSError, ValueError):
-            pass
-        return {"action": "stop", "stopped": False, "note": note,
-                "port": port}, None
-
-    raise BridgeError("INVALID_ARG", "unknown daemon command: %s" % cmd)
+        result = client.stop()
+        result["action"] = "stop"
+        return result, None
+    if cmd == "reconnect":
+        client.ensure_started()
+        result = client.reconnect()
+        result["action"] = "reconnect"
+        return result, None
+    raise BridgeError("INVALID_ARG", "unknown broker command: %s" % cmd)
 
 
 def _render_text(args, r):
@@ -359,7 +292,7 @@ def _render_text(args, r):
             print("moved %s -> %s" % (r["src"], r["dst"]))
     elif op == "hash":
         print("sha256:%s  %s" % (r["hash"], r["path"]))
-    elif op == "daemon":
+    elif op in ("broker", "daemon"):
         for k in sorted(r):
             print("%-16s %s" % (k, r[k]))
     elif op == "exec":
@@ -392,21 +325,33 @@ def main(argv=None):
             raise BridgeError("INVALID_CONFIG", "unknown profile: %s (have: %s)"
                               % (pname, ", ".join(cfg["profiles"])))
         profile = Profile(pname, cfg["profiles"][pname])
+        broker_client = None
+        if profile.connection_policy["mode"] == "broker":
+            broker_client = BrokerClient(cfg["file"], profile)
         if args.op == "serve":
             if args.json:
                 raise BridgeError(
                     "INVALID_ARG", "--json is not supported with serve")
             from .web import serve
             return serve(
-                profile, port=args.port, open_browser=not args.no_open)
-        elif args.op == "daemon":
-            result, raw = _daemon_mgmt(args, cfg, pname)
+                profile, config_path=cfg["file"], port=args.port,
+                open_browser=not args.no_open)
+        elif args.op in ("broker", "daemon"):
+            if broker_client is None:
+                raise BridgeError(
+                    "BROKER_UNSUPPORTED",
+                    "profile %s is configured for direct mode" % pname)
+            if args.op == "daemon" and not args.json:
+                print(
+                    "warning: 'daemon' is deprecated; use 'broker'",
+                    file=sys.stderr)
+            result, raw = _broker_mgmt(args, broker_client)
+            if args.op == "daemon":
+                result["deprecated"] = "use broker"
         else:
-            # transparently reuse the daemon's persistent connection when up
-            routed = _try_daemon(cfg.get("daemon_port", DEFAULT_PORT),
-                                 pname, args, profile)
-            if routed is not None:
-                result, raw = routed
+            if broker_client is not None:
+                result, raw = _broker_dispatch(
+                    broker_client, args, profile)
             else:
                 result, raw = dispatch(args, profile)
     except BridgeError as e:

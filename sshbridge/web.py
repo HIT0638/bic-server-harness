@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import ops
+from .broker_client import BrokerClient
 from .errors import BridgeError
 from .sftp_client import SftpSession, _is_connect_failure
 
@@ -33,22 +34,41 @@ _ERROR_STATUS = {
     "SSH_ERROR": 502,
     "SFTP_ERROR": 502,
     "TIMEOUT": 504,
+    "BROKER_UNAVAILABLE": 503,
+    "BROKER_PROFILE_MISMATCH": 409,
+    "CONNECTION_PAUSED": 503,
+    "CONNECTION_RATE_LIMITED": 429,
+    "MULTIPLEX_UNAVAILABLE": 503,
 }
 
 
 class WorkspaceService:
-    """Serialize access to one persistent SFTP session."""
+    """Route Web operations through broker or explicit direct mode."""
 
-    def __init__(self, profile):
+    def __init__(self, profile, config_path=None):
         self.profile = profile
+        self._broker = None
         self._session = None
         self._lock = threading.Lock()
+        if profile.connection_policy["mode"] == "broker":
+            if not config_path:
+                raise BridgeError(
+                    "INVALID_CONFIG",
+                    "config_path is required for broker-backed Web Explorer")
+            self._broker = BrokerClient(config_path, profile)
+            self._broker.ensure_started()
 
     def close(self):
+        if self._broker is not None:
+            return
         with self._lock:
             self._drop_session()
 
     def call(self, function, *args, **kwargs):
+        if self._broker is not None:
+            operation, arguments = self._broker_request(
+                function, args, kwargs)
+            return self._broker.request(operation, arguments, timeout=300)
         with self._lock:
             session = self._get_session()
             try:
@@ -58,6 +78,55 @@ class WorkspaceService:
                 if _is_connect_failure(error):
                     self._drop_session()
                 raise
+
+    def status(self):
+        if self._broker is not None:
+            return self._broker.status()
+        return {
+            "running": True,
+            "state": "READY" if self._session is not None else "DISCONNECTED",
+            "multiplexing": False,
+        }
+
+    def reconnect(self):
+        if self._broker is not None:
+            return self._broker.reconnect()
+        with self._lock:
+            self._drop_session()
+        return self.status()
+
+    def _broker_request(self, function, args, kwargs):
+        if function is ops.op_list_dir:
+            return "list_dir", {"path": args[0] if args else "/"}
+        if function is ops.op_stat:
+            return "stat", {"path": args[0]}
+        if function is ops.op_read_file:
+            return "read_file", {
+                "path": args[0],
+                "offset": kwargs.get("offset", 0),
+                "limit": kwargs.get("limit"),
+            }
+        if function is ops.op_write_file:
+            return "write_file", {
+                "path": args[0],
+                "data_b64": base64.b64encode(args[1]).decode("ascii"),
+                "expected_mtime": kwargs.get("expected_mtime"),
+                "expected_size": kwargs.get("expected_size"),
+                "expected_hash": kwargs.get("expected_hash"),
+                "force": bool(kwargs.get("force")),
+            }
+        if function is ops.op_mkdir:
+            return "mkdir", {
+                "path": args[0],
+                "parents": bool(kwargs.get("parents")),
+            }
+        if function is ops.op_move:
+            return "move", {
+                "src": args[0],
+                "dst": args[1],
+                "force": bool(kwargs.get("force")),
+            }
+        raise BridgeError("INVALID_ARG", "unsupported Web operation")
 
     def _get_session(self):
         if self._session is None or self._session._closed:
@@ -77,10 +146,10 @@ class WorkspaceService:
 class ExplorerHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, profile, token):
+    def __init__(self, address, profile, token, config_path=None):
         self.profile = profile
         self.token = token
-        self.workspace = WorkspaceService(profile)
+        self.workspace = WorkspaceService(profile, config_path=config_path)
         super().__init__(address, ExplorerHandler)
 
     def server_close(self):
@@ -111,6 +180,8 @@ class ExplorerHandler(BaseHTTPRequestHandler):
                 return self._api_mkdir(payload)
             if parsed.path == "/api/move":
                 return self._api_move(payload)
+            if parsed.path == "/api/reconnect":
+                return self._json_ok(self.server.workspace.reconnect())
             return self._json_error(404, "NOT_FOUND", "route not found")
         except BridgeError as error:
             return self._bridge_error(error)
@@ -124,10 +195,12 @@ class ExplorerHandler(BaseHTTPRequestHandler):
         path = query.get("path", ["/"])[0]
         try:
             if parsed.path == "/api/info":
+                connection = self.server.workspace.status()
                 return self._json_ok({
                     "profile": self.server.profile.name,
                     "workspace_root": "/",
                     "max_read_bytes": self.server.profile.max_read_bytes,
+                    "connection_state": connection.get("state"),
                 })
             if parsed.path == "/api/list":
                 result = self.server.workspace.call(ops.op_list_dir, path)
@@ -290,16 +363,18 @@ def _content_security_policy():
         "frame-ancestors 'none'")
 
 
-def create_server(profile, port=8765, token=None):
+def create_server(profile, config_path=None, port=8765, token=None):
     if not isinstance(port, int) or not (0 <= port <= 65535):
         raise BridgeError("INVALID_ARG", "port must be between 0 and 65535")
     return ExplorerHTTPServer(
-        ("127.0.0.1", port), profile, token or secrets.token_urlsafe(24))
+        ("127.0.0.1", port), profile, token or secrets.token_urlsafe(24),
+        config_path=config_path)
 
 
-def serve(profile, port=8765, open_browser=True):
+def serve(profile, config_path=None, port=8765, open_browser=True):
     try:
-        server = create_server(profile, port=port)
+        server = create_server(
+            profile, config_path=config_path, port=port)
     except OSError as error:
         raise BridgeError(
             "INVALID_ARG", "cannot listen on 127.0.0.1:%s: %s" % (port, error))

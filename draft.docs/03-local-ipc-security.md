@@ -1,91 +1,105 @@
 # 本地 IPC 安全
 
+## 状态
+
+POSIX Unix socket 方案已在 `feat/connection-broker` 分支实现。Windows named pipe
+尚未实现，Windows 不会回退到 localhost TCP Broker。
+
 ## 背景
 
-当前 daemon 监听 `127.0.0.1` TCP 端口，并接受换行分隔 JSON。协议支持远端文件
-读写、任意命令执行和 daemon 停止。daemon 继承启动用户的 SSH 配置和认证能力。
-
-Web Explorer 已使用随机 token，但 daemon 协议没有调用者认证。
+Broker 协议可读写远端文件、执行任意命令和停止 Broker，并继承启动用户的 SSH
+身份，因此本地 IPC 必须限制为当前用户访问。Web HTTP token 与 Broker IPC 是两个
+独立安全边界，浏览器不会直接连接 Broker socket。
 
 ## 当前实现
 
-`sshbridge/daemon.py::serve` 创建普通 TCP socket，并绑定调用参数指定的地址和端口：
+`sshbridge/broker_client.py::_ensure_runtime_dir` 要求运行目录由当前 UID 所有且权限
+严格为 `0700`：
 
 ```python
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind((host, port))
-srv.listen(16)
+if info.st_uid != os.getuid():
+    raise BridgeError(
+        "BROKER_UNAVAILABLE",
+        "broker runtime directory is not owned by the current user: %s"
+        % path)
+if stat.S_IMODE(info.st_mode) != 0o700:
+    raise BridgeError(
+        "BROKER_UNAVAILABLE",
+        "broker runtime directory mode must be 0700: %s" % path)
 ```
 
-`sshbridge/daemon.py::_client` 直接解析 JSON 并按 `op` 执行，没有 token、UID 或
-peer credential 校验：
+`sshbridge/broker.py::BrokerServer._bind` 使用 Unix socket 并将其权限设为 `0600`：
 
 ```python
-req = json.loads(raw.decode("utf-8"))
-op = req.get("op")
-if op == "shutdown":
-    _send(conn, {"ok": True, "result": {"bye": True}})
-    _SHUTDOWN.set()
-    return
-result = _run_op(profile, state, op, req.get("args", {}))
+self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+self.listener.bind(self.endpoint.socket_path)
+os.chmod(self.endpoint.socket_path, 0o600)
+self.listener.listen(32)
 ```
 
-默认调用路径固定使用 `127.0.0.1`，因此当前风险主要来自同一台机器上的其他进程。
+每个 endpoint 由 config 绝对路径、profile 名、host、port、user 和 root 的 SHA-256
+短摘要区分。metadata 包含协议版本、PID、随机实例 ID、profile fingerprint 和
+socket 路径，以同目录临时文件加 `os.replace` 写入，权限为 `0600`。
+
+请求包含：
+
+```json
+{
+  "version": 1,
+  "request_id": "随机请求 ID",
+  "profile": "profile fingerprint",
+  "op": "list_dir",
+  "args": {}
+}
+```
+
+响应回显 request ID 和实例 ID。客户端同时校验 metadata、profile fingerprint、
+socket 路径和 Broker 响应身份。支持 `getpeereid` 或 `SO_PEERCRED` 的系统还会校验
+peer UID。
+
+Broker 使用 profile 级 `flock` 防止重复实例。删除陈旧 socket 前验证 owner 和文件
+类型；停止时清理 socket、metadata、ControlPath 和 SSH 子进程。旧
+`sshbridge.daemon` 只转发到 Broker，不再创建 TCP listener。
 
 ## 痛点
 
-- 任意本机进程都可以尝试连接 daemon 端口。
-- 多用户机器上的其他用户可能借用 daemon 的 SSH 身份。
-- 恶意进程可读取或修改远端文件、执行命令或发送 shutdown。
-- 端口被容器、代理或端口转发暴露后，风险不再局限于本机。
-- 固定端口还会发生误连、旧进程占用和 profile 混淆。
+旧 daemon 使用未认证 localhost TCP。其他本机用户或被意外暴露到该端口的进程可
+借用 daemon 的 SSH 身份执行文件操作、命令和 shutdown，固定端口还存在旧实例与
+profile 混淆。
 
 ## 目标
 
-- 只有启动用户可以访问 broker。
-- broker endpoint 不对局域网和外部网络开放。
-- CLI、Web 和 MCP 能确认连接的是预期 profile 和 broker 实例。
-- shutdown、exec 和 write 等高权限请求不能匿名调用。
-- 不引入远端认证协议或替代 OpenSSH。
+- 只有当前用户可以访问 Broker。
+- endpoint 不对局域网或外部网络开放。
+- 客户端确认 profile、协议版本、请求和 Broker 实例身份。
+- 陈旧 endpoint 可以安全恢复，不删除其他用户或其他类型的文件。
+- Web 浏览器不能直接访问 Broker 原始协议。
 
 ## 预期
 
-- 同机其他普通用户无法连接 broker。
-- 浏览器页面不能直接访问 broker 原始协议。
-- endpoint 文件和认证材料随 broker 生命周期安全创建和清理。
-- 异常退出后可以识别并清理陈旧 socket，不误杀其他进程。
+- 同机其他普通用户无法打开 Broker socket。
+- 启动竞态只产生一个 Broker 和一个连接所有者。
+- profile 或实例不匹配时请求失败。
+- shutdown、exec 和 write 与其他请求使用相同访问控制。
 
 ## 方案
 
-### POSIX
+POSIX 使用当前用户私有运行目录中的 Unix socket、原子 metadata、profile 级
+`flock` 和可用时的 peer UID 校验。Windows 后续使用带当前用户 SID ACL 的 named
+pipe，不提供未认证 loopback TCP 回退。
 
-- 使用 Unix domain socket 替换 localhost TCP。
-- socket 放在用户私有运行目录，目录权限 `0700`，socket 权限 `0600`。
-- 启动时验证 socket owner 和 mode。
-- 使用 PID、随机实例 ID 和 profile fingerprint 检测陈旧 endpoint。
-- 可读取 peer credentials 的系统上，额外校验调用者 UID。
+## 已知限制
 
-### Windows
+- peer credential API 并非所有 POSIX 平台都提供；此时依赖 `0700` 目录和 `0600`
+  socket。
+- Unix socket 路径受平台长度限制。长 `SSHBRIDGE_STATE_DIR` 会通过当前用户私有
+  `/tmp/sshbridge-<uid>` 中的短 symlink 别名寻址，文件仍落在原状态目录。
+- 当前未实现 Windows named pipe 和当前用户 SID ACL。
+- 同一 UID 下的恶意进程仍处于相同信任边界；系统权限不能区分同一账户的进程。
 
-- 优先使用 named pipe。
-- pipe ACL 只允许当前用户 SID。
-- 若只能使用 loopback TCP，则每次启动生成高强度随机 token。
-- token 通过受保护状态文件传递，不放入进程列表或日志。
+## 验收结果
 
-### 协议
-
-- 每条请求携带协议版本、profile fingerprint 和 request ID。
-- broker 返回实例 ID，客户端避免连接到旧 profile。
-- 限制请求大小、读取超时和并发客户端数。
-- shutdown 仅接受已认证客户端。
-- 日志不记录文件内容、token、密钥和完整敏感命令。
-
-## 验收标准
-
-- socket 权限不是 `0600` 时 broker 拒绝启动。
-- 其他 UID 连接被拒绝。
-- profile fingerprint 不匹配时请求失败。
-- 陈旧 socket 可恢复，但不会删除其他运行实例的 endpoint。
-- 浏览器只能访问 Web API，不能直接调用 broker socket。
-- 安全测试覆盖未认证 read、write、exec 和 shutdown。
+- 单元测试覆盖运行目录 `0700`、metadata `0600`、错误目录权限和稳定 fingerprint。
+- 集成测试覆盖自动启动、实例复用、stop 清理和 profile 隔离路径。
+- Web 与 CLI 同时通过 Broker，不存在第二个 Web SFTP 所有者。
+- Windows 选择 broker 模式会返回 `BROKER_UNSUPPORTED`。

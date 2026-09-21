@@ -81,9 +81,10 @@ def _read_bytes(s, path, offset, length):
     return bytes(out)
 
 
-def _sha256(profile, real_path):
-    res = run_exec(profile, "sha256sum %s" % shlex.quote(real_path),
-                   profile.root, profile.exec_timeout)
+def _sha256(profile, real_path, exec_runner=None):
+    runner = exec_runner or run_exec
+    res = runner(profile, "sha256sum %s" % shlex.quote(real_path),
+                 profile.root, profile.exec_timeout)
     parts = res["stdout"].split()
     if res["exit_code"] != 0 or not parts:
         raise BridgeError(
@@ -164,7 +165,8 @@ def op_read_file(profile, path, offset=0, limit=None, session=None):
 
 
 def op_write_file(profile, path, data, expected_mtime=None, expected_size=None,
-                  expected_hash=None, force=False, session=None):
+                  expected_hash=None, force=False, session=None,
+                  exec_runner=None):
     if not isinstance(data, (bytes, bytearray)):
         raise BridgeError("INVALID_ARG", "write data must be bytes")
     data = bytes(data)
@@ -201,7 +203,8 @@ def op_write_file(profile, path, data, expected_mtime=None, expected_size=None,
             if expected_size is not None and current.get("size") != expected_size:
                 problems.append("size expected %s, current %s"
                                 % (expected_size, current.get("size")))
-            if expected_hash and _sha256(profile, target) != expected_hash:
+            if expected_hash \
+                    and _sha256(profile, target, exec_runner) != expected_hash:
                 problems.append("sha256 mismatch")
             if problems:
                 raise BridgeError(
@@ -319,7 +322,7 @@ def op_move(profile, src, dst, force=False, session=None):
             "real_path": dfinal, "overwrote": dst_exists}
 
 
-def op_exec(profile, command, cwd="/", timeout=None):
+def op_exec(profile, command, cwd="/", timeout=None, exec_runner=None):
     """Run a shell command remotely.
 
     Note: exec accepts arbitrary commands by design, so the cwd sandbox is
@@ -334,7 +337,8 @@ def op_exec(profile, command, cwd="/", timeout=None):
     if not isinstance(timeout, (int, float)) or timeout <= 0:
         raise BridgeError("INVALID_ARG", "timeout must be > 0")
     cwd_real = resolve_virtual(cwd, profile.root)
-    res = run_exec(profile, command, cwd_real, timeout)
+    runner = exec_runner or run_exec
+    res = runner(profile, command, cwd_real, timeout)
     out = {
         "op": "exec",
         "cwd": cwd,
@@ -354,7 +358,7 @@ def op_exec(profile, command, cwd="/", timeout=None):
     return out
 
 
-def op_hash(profile, path, session=None):
+def op_hash(profile, path, session=None, exec_runner=None):
     with _maybe_session(profile, session) as s:
         croot = _canon_root(s, profile)
         canon = s.realpath(resolve_virtual(path, profile.root))
@@ -362,6 +366,6 @@ def op_hash(profile, path, session=None):
         st = s.stat(canon)
         if P.file_type(st.get("perms")) != "file":
             raise BridgeError("NOT_A_FILE", "not a regular file: %s" % path)
-    digest = _sha256(profile, canon)
+    digest = _sha256(profile, canon, exec_runner)
     return {"op": "hash", "path": path, "real_path": canon,
             "algo": "sha256", "hash": digest, "size": st.get("size")}

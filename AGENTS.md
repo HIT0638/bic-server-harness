@@ -42,13 +42,25 @@ glibc 2.17 的老旧 Linux 服务器；只假定远端存在 OpenSSH、SFTP 与 
 stdout、stderr、退出码和超时状态必须结构化返回。本地 SSH 超时不能证明远端进程已
 终止；结果中必须保留该提示。
 
-## Daemon 规则
+## Broker 规则
 
-daemon 串行访问一个常驻 SFTP 会话。不得在独立 `exec` 工作期间持有该锁，因为
-`exec` 不访问 SFTP 会话。
+macOS/Linux 的 CLI、Web 和后续 MCP 入口必须通过 Connection Broker 访问正式
+profile，不得增加 Broker 失败后的隐藏直连回退。`direct` 模式只用于显式配置的
+诊断和兼容场景。
 
-不得扩大 daemon 网络暴露面。当前 localhost TCP 协议未认证，仅适用于可信的单用户
-本机环境。后续加固优先使用具有限制权限的 Unix socket。
+Broker 对每个 profile 只管理一个 OpenSSH ControlMaster 和一个顺序 SFTP channel。
+SFTP 锁不得覆盖独立 Exec I/O；Exec 通过独立 semaphore 限制并发。
+
+Broker 只能监听当前用户私有运行目录中的 Unix socket。运行目录必须为 `0700`，
+socket 和 metadata 必须为 `0600`，并保留 profile fingerprint、协议版本、
+request ID、实例 ID、单例锁和可用时的 peer UID 校验。
+
+首次连接失败必须进入 `OPEN`，业务请求不得自动重连。只有显式
+`broker reconnect` 可以在连接门控允许后执行一次尝试。Broker 调用 SFTP 与 Exec
+时必须使用 `connect_retries=0`。
+
+Windows named pipe 尚未实现。Windows 必须保持显式 direct 兼容路径，不得回退到
+未认证 localhost TCP Broker。
 
 ## 兼容性
 
@@ -68,8 +80,8 @@ python3 -m compileall -q sshbridge remote.py
 ```
 
 每次行为改动都应新增测试。优先添加 mock SFTP transport 或一次性 SSH 测试主机的
-操作级测试，覆盖沙箱逃逸、符号链接、原子写入、冲突检查、超时、daemon 路由和
-CLI JSON 输出。
+操作级测试，覆盖沙箱逃逸、符号链接、原子写入、冲突检查、超时、Broker 路由、
+熔断、并发队列和 CLI JSON 输出。
 
 `tests/local_sshd.py` 提供隔离的真实 OpenSSH 测试环境。集成测试必须使用临时密钥、
 随机 localhost 端口、临时工作区和 `SSHBRIDGE_STATE_DIR`，不得访问
@@ -85,6 +97,6 @@ OpenSSH 工具存在但行为回归时必须测试失败。
 ## 仓库规范
 
 - `bridge.json` 必须保留本地；只跟踪 `bridge.example.json`。
-- 不得提交 SSH 私钥、SSH 配置、主机专属凭据、daemon PID 文件、日志、字节码或
+- 不得提交 SSH 私钥、SSH 配置、主机专属凭据、Broker 状态文件、日志、字节码或
   虚拟环境。
 - 文档必须保持事实准确。命令语法、安全边界、配置或支持操作变化时，更新 `README.md`。

@@ -19,8 +19,8 @@ for off in range(0, len(data), CHUNK):
     s.write_chunk(handle, off, data[off:off + CHUNK])
 ```
 
-读取也在同一 SFTP session 中按 chunk 顺序完成。Web 和 daemon 都会串行化各自
-session 上的操作。当前没有批量同步 API、能力探测或传输任务状态。
+读取也在 Broker 的同一 SFTP session 中按 chunk 顺序完成。CLI 与 Web 共享该
+session，操作由 `sftp_lock` 串行化。当前没有批量同步 API、能力探测或传输任务状态。
 
 ## 痛点
 

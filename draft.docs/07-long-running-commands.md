@@ -3,8 +3,7 @@
 ## 背景
 
 构建、测试、日志分析和数据处理可能持续数分钟或更久。当前 `exec` 使用
-`subprocess.run`，等待命令结束后一次性返回 stdout 和 stderr。daemon 又在全局锁内
-执行请求，因此一个长命令可能阻塞其他 daemon 请求。
+`subprocess.run`，等待命令结束后一次性返回 stdout 和 stderr。
 
 SSH 协议允许一个 TCP transport 同时承载多个 session channel。OpenSSH
 ControlMaster 可以让多个本地 `ssh` 子进程共享同一 TCP。
@@ -36,16 +35,23 @@ except subprocess.TimeoutExpired as e:
     }
 ```
 
-`sshbridge/daemon.py::_run_op` 在全局 `state["lock"]` 内调用 `_dispatch`。由于
-`_dispatch` 也处理 `exec`，长命令会占用同一把锁并阻塞 daemon 的文件请求。
+`sshbridge/broker.py::BrokerState` 已将 Exec 与 SFTP 锁分离，并用独立 semaphore
+限制并发：
+
+```python
+self.exec_semaphore = threading.BoundedSemaphore(self.exec_limit)
+self.sftp_lock = threading.Lock()
+```
+
+ControlMaster 可用时默认允许两个 Exec channel。第三个请求增加 `queued_exec` 后等待，
+不会持有 `sftp_lock`。集成测试已验证两个 Exec 并行期间 `list_dir` 可完成。
 
 ## 痛点
 
-- 长命令占用 daemon 全局锁。
 - stdout 和 stderr 完成前不可增量读取。
 - 本地 timeout 杀死 ssh 后，远端进程可能继续运行。
-- 无 ControlMaster 时，每条命令都产生新的 TCP 握手。
 - 无任务 ID，调用方无法查询状态或主动取消。
+- 当前 Exec 等待队列没有独立长度上限和排队超时。
 
 ## 目标
 
@@ -112,9 +118,9 @@ exec_cancel(job_id)
 
 ## 验收标准
 
-- 运行 60 秒命令时，`list_dir` 不被阻塞。
-- 两个 Exec channel 共享同一 ControlMaster TCP。
-- 第三个命令排队且不产生新 TCP。
+- 已验证：长 Exec 运行时，`list_dir` 不被阻塞。
+- 已验证：两个 Exec channel 共享同一 ControlMaster TCP。
+- 已验证：第三个命令排队且不产生新 TCP。
 - stdout/stderr 可按 cursor 增量获取。
 - 输出超过限制时明确标记截断。
 - 取消和超时结果不错误宣称远端进程已终止。

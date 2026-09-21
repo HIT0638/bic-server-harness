@@ -21,7 +21,19 @@ DEFAULTS = {
     "ssh_args": [],                       # extra ssh options, e.g. ["-i", "key", "-J", "jump"]
 }
 
+CONNECTION_POLICY_DEFAULTS = {
+    "mode": "direct" if sys.platform == "win32" else "broker",
+    "exec_concurrency": 2,
+    "min_connect_interval": 10,
+    "connect_retries": 0,
+    "auto_reconnect": False,
+    "cooldown_initial": 60,
+    "cooldown_max": 1800,
+    "control_master": sys.platform != "win32",
+}
+
 _VALID_STRICT = ("yes", "no", "accept-new", "off")
+_VALID_CONNECTION_MODES = ("broker", "direct")
 
 DEFAULT_PORT = 7766  # local daemon port (configurable via "daemon_port")
 
@@ -61,7 +73,8 @@ class Profile:
     def __init__(self, name, raw):
         if not isinstance(raw, dict):
             raise BridgeError("INVALID_CONFIG", "profile %s must be an object" % name)
-        unknown = set(raw) - set(DEFAULTS) - {"host", "user", "root"}
+        unknown = set(raw) - set(DEFAULTS) - {
+            "host", "user", "root", "connection_policy"}
         if unknown:
             raise BridgeError("INVALID_CONFIG",
                               "unknown keys in profile %s: %s" % (name, sorted(unknown)))
@@ -85,9 +98,68 @@ class Profile:
                               % (name, _VALID_STRICT))
         if not isinstance(opts["ssh_args"], list):
             raise BridgeError("INVALID_CONFIG", "profile %s: ssh_args must be a list" % name)
+        self.connection_policy = self._connection_policy(
+            raw.get("connection_policy"))
+        self.control_path = None
         self.__dict__.update(opts)
 
-    def ssh_argv(self):
+    def _connection_policy(self, raw):
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: connection_policy must be an object" % self.name)
+        unknown = set(raw) - set(CONNECTION_POLICY_DEFAULTS)
+        if unknown:
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: unknown connection_policy keys: %s"
+                % (self.name, sorted(unknown)))
+        policy = dict(CONNECTION_POLICY_DEFAULTS)
+        policy.update(raw)
+        if policy["mode"] not in _VALID_CONNECTION_MODES:
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: connection_policy.mode must be one of %s"
+                % (self.name, _VALID_CONNECTION_MODES))
+        if not isinstance(policy["exec_concurrency"], int) \
+                or isinstance(policy["exec_concurrency"], bool) \
+                or not (1 <= policy["exec_concurrency"] <= 3):
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: connection_policy.exec_concurrency "
+                "must be an integer from 1 to 3" % self.name)
+        for key in ("min_connect_interval", "cooldown_initial",
+                    "cooldown_max"):
+            value = policy[key]
+            if not isinstance(value, (int, float)) or isinstance(value, bool) \
+                    or value < 0:
+                raise BridgeError(
+                    "INVALID_CONFIG",
+                    "profile %s: connection_policy.%s must be >= 0"
+                    % (self.name, key))
+        if policy["cooldown_max"] < policy["cooldown_initial"]:
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: connection_policy.cooldown_max must be "
+                ">= cooldown_initial" % self.name)
+        if not isinstance(policy["connect_retries"], int) \
+                or isinstance(policy["connect_retries"], bool) \
+                or policy["connect_retries"] != 0:
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: connection_policy.connect_retries must be 0"
+                % self.name)
+        for key in ("auto_reconnect", "control_master"):
+            if not isinstance(policy[key], bool):
+                raise BridgeError(
+                    "INVALID_CONFIG",
+                    "profile %s: connection_policy.%s must be boolean"
+                    % (self.name, key))
+        return policy
+
+    def ssh_argv(self, extra_args=None):
         argv = [
             self.ssh_bin,
             "-p", str(int(self.port)),
@@ -101,10 +173,32 @@ class Profile:
         # setting in ~/.ssh/config cannot break every invocation.
         if sys.platform == "win32" and not self.allow_controlmaster:
             argv += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+        if extra_args:
+            argv += [str(a) for a in extra_args]
         return argv + [str(a) for a in self.ssh_args]
 
     def sftp_argv(self):
-        return self.ssh_argv() + ["-s", "--", self.host, "sftp"]
+        extra = None
+        if self.control_path:
+            extra = ["-S", self.control_path, "-o", "ControlMaster=no"]
+        return self.ssh_argv(extra) + ["-s", "--", self.host, "sftp"]
 
     def exec_argv(self, remote_command):
-        return self.ssh_argv() + ["--", self.host, remote_command]
+        extra = None
+        if self.control_path:
+            extra = ["-S", self.control_path, "-o", "ControlMaster=no"]
+        return self.ssh_argv(extra) + ["--", self.host, remote_command]
+
+    def master_argv(self, control_path):
+        return self.ssh_argv([
+            "-M", "-N", "-S", control_path,
+            "-o", "ControlPersist=no",
+            "-o", "ExitOnForwardFailure=yes",
+        ]) + ["--", self.host]
+
+    def control_argv(self, control_path, operation):
+        return self.ssh_argv([
+            "-S", control_path,
+            "-o", "ControlMaster=no",
+            "-O", operation,
+        ]) + ["--", self.host]

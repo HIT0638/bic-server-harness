@@ -21,7 +21,9 @@ Node.js、新版 glibc 或 Agent Runtime。
 - 限制单次读取大小，并支持 offset/limit 分段读取。
 - 复用用户 SSH 配置、SSH Agent、`ProxyJump`、known hosts 与支持的
   OpenSSH 连接复用。
-- 可选本地 daemon，为重复文件操作保留一个 SFTP 会话。
+- 默认通过本地 Connection Broker 复用一个 SSH TCP 和一个 SFTP channel。
+- ControlMaster 可用时允许两个 Exec channel 并行，且不阻塞 SFTP 文件操作。
+- 首次连接失败后进入熔断状态，只接受显式重连，不自动形成连接风暴。
 - 本地 Web Explorer 提供懒加载目录树、文本查看与编辑、新建和重命名。
 
 ## 前置条件
@@ -47,7 +49,6 @@ cp bridge.example.json bridge.json
 ```json
 {
   "default_profile": "legacy-linux",
-  "daemon_port": 7766,
   "profiles": {
     "legacy-linux": {
       "host": "legacy-host",
@@ -55,6 +56,16 @@ cp bridge.example.json bridge.json
       "user": "remote-user",
       "root": "/home/remote-user/project",
       "strict_host_key": "yes",
+      "connection_policy": {
+        "mode": "broker",
+        "exec_concurrency": 2,
+        "min_connect_interval": 10,
+        "connect_retries": 0,
+        "auto_reconnect": false,
+        "cooldown_initial": 60,
+        "cooldown_max": 1800,
+        "control_master": true
+      },
       "ssh_args": [
         "-o",
         "ServerAliveInterval=60",
@@ -67,6 +78,11 @@ cp bridge.example.json bridge.json
 ```
 
 `bridge.json` 已被 Git 忽略。它用于保存本机与远端环境配置。
+
+macOS 和 Linux 默认使用 `broker` 模式。`direct` 模式仅用于诊断和兼容；它不会
+提供跨进程连接复用或全局熔断保护。Windows 当前默认使用 `direct`，本期尚未实现
+具备当前用户 ACL 的 named pipe，因此显式选择 `broker` 会返回
+`BROKER_UNSUPPORTED`。
 
 ## CLI 使用
 
@@ -126,7 +142,8 @@ python3 remote.py --config bridge.json serve --port 0 --no-open
 - 保存时使用 mtime 与文件大小检查远端并发修改。
 - 新建文件、新建目录、重命名和刷新。
 - 二进制文件与超过 `max_read_bytes` 的文件只显示元数据，不进入编辑器。
-- 一个由服务进程持有并串行访问的常驻 SFTP 会话。
+- CLI 与 Web 共用 Broker 持有的 SFTP channel，不另建独立 SSH TCP。
+- 连接熔断时显示“连接已暂停”，只能通过界面中的重新连接按钮恢复。
 
 Web 服务固定绑定 `127.0.0.1`，不能通过参数改为外网地址。API 请求必须携带启动时
 生成的随机 token。浏览器只使用虚拟工作区路径，API 不返回真实远端根路径或 SSH
@@ -153,18 +170,31 @@ python3 remote.py --profile local-test serve
 `only4test/`，Git 会正常显示这些变化。停止 sshd 不会删除密钥或工作区，下次启动
 继续使用同一个 profile。
 
-## Daemon
+## Connection Broker
 
-可选 daemon 保留一个 SFTP 连接。远端路径限制新建 SSH 连接时，可减少连接次数。
+Broker 按 profile 自动启动，只监听当前用户可访问的 Unix socket。启动本地 Broker
+不会立即连接远端；首个文件或命令请求才会建立 SSH。
 
 ```sh
-python3 remote.py --config bridge.json daemon start
-python3 remote.py --config bridge.json daemon status
-python3 remote.py --config bridge.json daemon stop
+python3 remote.py --config bridge.json broker start
+python3 remote.py --config bridge.json broker status
+python3 remote.py --config bridge.json broker reconnect
+python3 remote.py --config bridge.json broker stop
 ```
 
-daemon 一次只服务一个 profile。当前实现使用未认证的 localhost TCP 端口。
-在改为权限受控的 Unix socket 或带认证的本地协议前，只应在可信单用户环境运行。
+普通 CLI 和 Web 请求会自动启动 Broker。Broker 不可用时不会回退直连。连接或认证
+首次失败后状态进入 `OPEN`，后续业务请求立即返回 `CONNECTION_PAUSED`；只有
+`broker reconnect` 会执行一次受频率限制的重连。
+
+Broker 的运行目录权限为 `0700`，socket 和 metadata 权限为 `0600`。请求携带协议
+版本、request ID 和 profile fingerprint；支持 peer credential 的系统还会校验
+客户端 UID。`daemon start|status|reconnect|stop` 暂时保留为弃用别名，不再监听
+localhost TCP。
+
+OpenSSH ControlMaster 可用时，Broker 持有一个 TCP、一个顺序 SFTP channel，并允许
+最多 `exec_concurrency` 个 Exec channel 并行。ControlMaster 被禁用或本地客户端
+不支持时，SFTP 仍保持一个连接，Exec 降为单并发且每次建连受
+`min_connect_interval` 限制。
 
 ## 安全边界
 
@@ -180,14 +210,17 @@ SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的
 
 ## 架构
 
-- `sshbridge/cli.py`：参数解析、结果渲染、daemon 路由。
+- `sshbridge/cli.py`：参数解析、结果渲染、Broker 路由。
+- `sshbridge/broker_client.py`：Unix socket endpoint、自动启动与客户端协议。
+- `sshbridge/broker.py`：连接状态机、SFTP/Exec 队列和请求分发。
+- `sshbridge/transport.py`：OpenSSH ControlMaster 生命周期。
 - `sshbridge/ops.py`：可复用且 JSON 就绪的桥接操作 API。
 - `sshbridge/paths.py`：虚拟路径规范化与根目录包含性检查。
 - `sshbridge/sftp_client.py`：运行于 `ssh -s sftp` 的 SFTP v3 客户端。
 - `sshbridge/sftp_proto.py`：SFTP 报文编解码。
 - `sshbridge/exec_client.py`：通过 `ssh` 执行远端命令。
-- `sshbridge/daemon.py`：可选的常驻本地 SFTP daemon。
-- `sshbridge/web.py`：本地 Web/API 服务、token 鉴权和 SFTP 会话复用。
+- `sshbridge/daemon.py`：旧 daemon 命令的 Broker 兼容入口。
+- `sshbridge/web.py`：本地 Web/API 服务、token 鉴权和 Broker 调用。
 - `sshbridge/web_assets/`：远程目录树与文本编辑界面。
 - `sshbridge/config.py`：profile 解析与 OpenSSH 调用选项。
 
@@ -207,12 +240,12 @@ python3 -m compileall -q sshbridge remote.py
 - 将版本化的 `only4test/` 复制为临时远端工作区初始内容。
 - 使用临时 host key、client key、`authorized_keys`、known_hosts 配置和工作区。
 - 禁用密码认证，只接受临时测试密钥。
-- 测试结束后关闭 sshd、bridge daemon 并删除全部临时文件。
+- 测试结束后关闭 sshd、Broker、ControlMaster 并删除全部临时文件。
 - 不读取或修改系统 SSH 配置、`~/.ssh` 与项目 `bridge.json`。
 
 本地缺少 `ssh`、`sshd` 或 `ssh-keygen` 时，集成测试自动跳过；路径与协议单元测试
 仍会运行。当前集成测试覆盖真实 SFTP 文件流程、并发冲突、符号链接逃逸、大文件限制、
-结构化命令结果、超时、CLI JSON、daemon 连接复用和 Web API。
+结构化命令结果、超时、CLI JSON、Broker 连接复用、熔断、并发队列和 Web API。
 
 也可手动启动测试环境：
 
@@ -226,9 +259,11 @@ python3 tests/local_sshd.py
 需要长期保留的本地测试文件放在 `only4test/`。运行时只修改临时副本，不会修改
 Git 中的原始测试文件。
 
-集成测试通过 `SSHBRIDGE_STATE_DIR` 将 daemon PID 和日志放入临时目录。未设置时，
-daemon 状态文件仍位于项目根目录。
+集成测试通过 `SSHBRIDGE_STATE_DIR` 隔离 Broker socket、metadata、锁、ControlPath
+和日志。未设置时，优先使用 `XDG_RUNTIME_DIR/sshbridge`，否则使用当前用户私有的
+`/tmp/sshbridge-<uid>`。
 
 ## 状态
 
-CLI 与 Web Explorer MVP 已实现。MCP Server 封装仍是后续工作。
+CLI、Connection Broker 与 Web Explorer MVP 已实现。MCP Server、Rsync channel 和
+Windows named pipe 仍是后续工作。

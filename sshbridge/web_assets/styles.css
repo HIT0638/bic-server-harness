@@ -110,6 +110,25 @@ button {
   font-size: 12px;
 }
 
+.connection-action {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.connection-action:hover,
+.connection-action:focus-visible {
+  background: var(--surface-hover);
+  outline: none;
+}
+
 .connection-dot {
   width: 8px;
   height: 8px;

@@ -25,7 +25,8 @@ def op_list_dir(profile, path="/", session=None):
             "real_path": canon, "entries": entries}
 ```
 
-CLI 和 daemon 已调用该层。MCP 适配器尚不存在，不附 MCP 协议实现代码。
+Broker 已调用该层，CLI 与 Web 通过 Broker 间接复用相同语义。旧 daemon 入口只是
+Broker 兼容别名。MCP 适配器尚不存在，不附 MCP 协议实现代码。
 
 ## 痛点
 

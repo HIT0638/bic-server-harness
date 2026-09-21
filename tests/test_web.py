@@ -1,5 +1,6 @@
 import errno
 import json
+import os
 import socket
 import threading
 import unittest
@@ -19,13 +20,16 @@ class TestWebExplorerIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sshd = LocalSshd()
+        cls.previous_state_dir = os.environ.get("SSHBRIDGE_STATE_DIR")
         try:
             cls.sshd.start()
+            os.environ["SSHBRIDGE_STATE_DIR"] = str(cls.sshd.daemon_state)
             (cls.sshd.workspace / SENTINEL_NAME).write_text(
                 SENTINEL_CONTENT, encoding="utf-8")
-            cls.profile = Profile("web-test", cls.sshd.profile_raw)
+            cls.profile = Profile("local-test", cls.sshd.profile_raw)
             cls.web = create_server(
-                cls.profile, port=0, token="test-token")
+                cls.profile, config_path=str(cls.sshd.config_path),
+                port=0, token="test-token")
             cls.thread = threading.Thread(
                 target=cls.web.serve_forever, daemon=True)
             cls.thread.start()
@@ -35,6 +39,7 @@ class TestWebExplorerIntegration(unittest.TestCase):
             raise unittest.SkipTest(str(exc))
         except Exception:
             cls.sshd.stop()
+            cls._restore_state_dir()
             raise
 
     @classmethod
@@ -44,7 +49,19 @@ class TestWebExplorerIntegration(unittest.TestCase):
             cls.web.server_close()
         if getattr(cls, "thread", None) is not None:
             cls.thread.join(timeout=5)
+        broker = getattr(
+            getattr(cls, "web", None), "workspace", None)
+        if broker is not None and broker._broker is not None:
+            broker._broker.stop()
         cls.sshd.stop()
+        cls._restore_state_dir()
+
+    @classmethod
+    def _restore_state_dir(cls):
+        if cls.previous_state_dir is None:
+            os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+        else:
+            os.environ["SSHBRIDGE_STATE_DIR"] = cls.previous_state_dir
 
     def request(self, path, method="GET", body=None, token="test-token"):
         data = None
@@ -80,7 +97,7 @@ class TestWebExplorerIntegration(unittest.TestCase):
 
         status, _, payload = self.request_json("/api/info")
         self.assertEqual(status, 200)
-        self.assertEqual(payload["profile"], "web-test")
+        self.assertEqual(payload["profile"], "local-test")
         self.assertEqual(payload["workspace_root"], "/")
         self.assertNotIn("root", payload)
 
@@ -90,7 +107,9 @@ class TestWebExplorerIntegration(unittest.TestCase):
             listener.listen(1)
             port = listener.getsockname()[1]
             with self.assertRaises(OSError) as caught:
-                create_server(self.profile, port=port, token="test-token")
+                create_server(
+                    self.profile, config_path=str(self.sshd.config_path),
+                    port=port, token="test-token")
         self.assertEqual(caught.exception.errno, errno.EADDRINUSE)
 
     def test_remote_file_workflow(self):

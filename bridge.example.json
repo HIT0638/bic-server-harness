@@ -1,6 +1,5 @@
 {
   "default_profile": "legacy-linux",
-  "daemon_port": 7766,
   "profiles": {
     "legacy-linux": {
       "host": "legacy-host",
@@ -9,6 +8,16 @@
       "root": "/home/remote-user/project",
       "batch_mode": true,
       "strict_host_key": "yes",
+      "connection_policy": {
+        "mode": "broker",
+        "exec_concurrency": 2,
+        "min_connect_interval": 10,
+        "connect_retries": 0,
+        "auto_reconnect": false,
+        "cooldown_initial": 60,
+        "cooldown_max": 1800,
+        "control_master": true
+      },
       "ssh_args": [
         "-o",
         "ServerAliveInterval=60",

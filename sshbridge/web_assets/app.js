@@ -14,6 +14,7 @@
     tree: document.querySelector("#tree"),
     profile: document.querySelector("#profile-name"),
     connectionDot: document.querySelector("#connection-dot"),
+    reconnect: document.querySelector("#reconnect"),
     currentPath: document.querySelector("#current-path"),
     dirty: document.querySelector("#dirty-indicator"),
     editor: document.querySelector("#editor"),
@@ -55,10 +56,14 @@
       throw {code: "BAD_RESPONSE", message: "服务返回了无效响应"};
     }
     if (!response.ok || !payload.ok) {
-      throw payload.error || {
+      const error = payload.error || {
         code: "REQUEST_FAILED",
         message: `请求失败 (${response.status})`,
       };
+      if (error.code === "CONNECTION_PAUSED") {
+        setConnectionPaused();
+      }
+      throw error;
     }
     return payload;
   }
@@ -117,6 +122,37 @@
   function setConnected(connected) {
     elements.connectionDot.classList.toggle("connected", connected);
     elements.connectionDot.classList.toggle("failed", !connected);
+    if (connected) {
+      elements.reconnect.hidden = true;
+      if (state.info) elements.profile.textContent = state.info.profile;
+    }
+  }
+
+  function setConnectionPaused() {
+    setConnected(false);
+    elements.profile.textContent = "连接已暂停";
+    elements.reconnect.hidden = false;
+  }
+
+  async function reconnect() {
+    setBusy("重新连接");
+    elements.reconnect.disabled = true;
+    try {
+      await api("/api/reconnect", {method: "POST", body: {}});
+      setConnected(true);
+      state.directories.clear();
+      await loadDirectory("/", true);
+      showToast("连接已恢复");
+    } catch (error) {
+      if (error.code === "CONNECTION_PAUSED" ||
+          error.code === "CONNECTION_RATE_LIMITED") {
+        setConnectionPaused();
+      }
+      showToast(errorMessage(error), true);
+    } finally {
+      elements.reconnect.disabled = false;
+      setBusy("");
+    }
   }
 
   async function loadDirectory(path, force = false) {
@@ -525,6 +561,7 @@
   elements.newFile.addEventListener("click", createFile);
   elements.newFolder.addEventListener("click", createFolder);
   elements.rename.addEventListener("click", renameSelected);
+  elements.reconnect.addEventListener("click", reconnect);
   window.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
       event.preventDefault();

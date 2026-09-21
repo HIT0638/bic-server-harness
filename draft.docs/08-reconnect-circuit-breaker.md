@@ -1,78 +1,77 @@
 # 重连与熔断
 
+## 状态
+
+已在 `feat/connection-broker` 分支实现首次失败熔断、连接门控和显式 reconnect。
+
 ## 背景
 
-当前 SFTP 和 Exec 客户端默认在连接失败时重试两次，即一次调用最多触发三次连接尝试。
-daemon 在共享 SFTP 会话失效后还会再创建新会话，并在部分失败后进入指数冷却。
-
-正式服务器会根据短时间连接或认证失败次数封禁来源 IP，因此常见的自动重试策略可能
-放大故障。
+正式服务器可能根据短时间连接或认证失败次数封禁来源 IP。多个 CLI 或 Web 进程各自
+自动重试会放大故障，因此所有受保护连接尝试必须由单一 Broker 计数和执行。
 
 ## 当前实现
 
-`sshbridge/sftp_client.py::SftpSession` 默认重试两次，因此一次创建最多启动三个
-OpenSSH 子进程：
+`sshbridge/broker.py::BrokerState.ensure_ready` 在 `OPEN` 状态直接拒绝业务请求：
 
 ```python
-def __init__(self, argv, op_timeout=60,
-             connect_retries=2, retry_delay=3.0):
-    for attempt in range(connect_retries + 1):
-        self._spawn(argv)
-        try:
-            self.version = self._handshake()
-            return
-        except BridgeError as e:
-            self._hard_shutdown()
-            if not _is_connect_failure(e) or attempt == connect_retries:
-                raise
-            time.sleep(retry_delay * (attempt + 1))
+if current == "OPEN" and not manual:
+    raise self._paused_error_locked()
 ```
 
-`sshbridge/exec_client.py::run_exec` 对返回码 255 且命中连接错误标记的请求采用相同的
-默认重试次数：
+首次连接失败由 `_mark_open` 记录失败次数、最后错误和冷却截止时间：
 
 ```python
-attempts = connect_retries + 1
-for attempt in range(attempts):
-    cp = subprocess.run(argv, capture_output=True, timeout=timeout)
-    if cp.returncode == 255 and _is_pre_auth_failure(cp.stderr) \
-            and attempt < attempts - 1:
-        time.sleep(retry_delay * (attempt + 1))
-        continue
-    break
+def _open_state_locked(self, error):
+    self.state = "OPEN"
+    self.failure_count += 1
+    delay = min(
+        self.policy["cooldown_initial"]
+        * (2 ** max(0, self.failure_count - 1)),
+        self.policy["cooldown_max"])
+    self.cooldown_until = time.time() + delay
+    self.last_error = error.to_dict()
 ```
 
-daemon 在 SFTP 建连失败后设置 60 秒起步、最长 1800 秒的冷却，但该状态只存在于
-daemon 进程内。Web、直接 CLI 和其他进程不共享该冷却。
+Broker 创建 SFTP 与 Exec channel 时显式传入 `connect_retries=0`。SFTP 的连接失败
+分类先排除认证和 host key 错误，不再使用宽泛的 `"unexpectedly"` 标记。Exec 只把
+已知 SSH transport stderr 与返回码 255 组合识别为连接故障；普通远端非零退出仍是
+业务结果。
+
+`BrokerState.reconnect` 在连接锁内检查 `min_connect_interval`。允许后关闭旧
+SFTP/ControlMaster，并通过 `HALF_OPEN` 执行一次连接尝试。成功回到 `READY`，
+失败回到 `OPEN`。`cooldown_until` 记录指数冷却建议，但不会阻止用户在最小建连
+间隔后进行显式重连。
+
+CLI 和 Web 均不会自动调用 reconnect。Web 收到 `CONNECTION_PAUSED` 后显示“连接已
+暂停”和显式重连按钮。
 
 ## 痛点
 
-- 多个进程可以同时重试，单进程退避无法限制全局频率。
-- SFTP 的 `"unexpectedly"` 判断范围过宽，认证失败也可能被视为可重试。
-- Web 在连接失效后，下一个请求会立即重新连接。
-- 用户无法查看最近连接尝试和剩余冷却时间。
-- 当前没有明确的手动重连命令。
-- 连接被封禁后继续探测可能延长封禁时间。
+旧 SFTP 和 Exec 客户端一次调用最多自动尝试三次，daemon 还可能额外重建 session。
+多个进程不共享失败状态，认证或网络故障可能迅速放大为连接风暴并延长远端封禁。
 
 ## 目标
 
-- 所有连接尝试由 broker 统一计数和执行。
-- 保护模式默认不自动连续重试。
-- 失败后停止新连接，保留明确的熔断状态。
-- 用户可以手动触发一次受控重连。
-- 区分网络故障、主机密钥问题、认证失败和远端命令退出。
+- 所有受保护连接尝试由 Broker 串行门控。
+- 单次业务请求最多进行一次连接尝试。
+- 首次失败后停止自动探测。
+- 用户可查看失败状态并显式触发一次重连。
+- 远端命令失败与 SSH transport 失败保持区分。
 
 ## 预期
 
-- 单次操作最多触发一次 SSH TCP 建连。
-- 多个客户端同时请求时，只允许一个连接尝试。
-- 认证失败不会自动重复提交。
-- 冷却期间所有调用立即返回，不等待网络超时。
-- 用户能看到失败原因、上次尝试时间和下一次允许时间。
+- 并发客户端在故障时只产生一个连接尝试。
+- `OPEN` 状态请求立即失败，不等待网络超时。
+- 认证和 host key 错误不会自动重试。
+- 显式 reconnect 成功恢复，失败后继续保持熔断。
 
 ## 方案
 
-### 状态机
+Broker 使用 `DISCONNECTED`、`CONNECTING`、`READY`、`OPEN` 和 `HALF_OPEN`
+状态机，并结合 `connect_lock`、`min_connect_interval` 和指数冷却字段控制连接。
+业务请求不能从 `OPEN` 自动转换；只有 reconnect 可进入 `HALF_OPEN`。
+
+## 状态机
 
 ```text
 DISCONNECTED -> CONNECTING -> READY
@@ -80,39 +79,29 @@ DISCONNECTED -> CONNECTING -> READY
                      v
                    OPEN
                      |
-        manual retry or cooldown
+              manual reconnect
                      v
                  HALF_OPEN
+                  /     \
+              READY     OPEN
 ```
 
+- `DISCONNECTED`：Broker 已启动，但尚未访问远端。
+- `CONNECTING`：首个业务请求正在建立连接。
 - `READY`：复用现有 transport。
-- `OPEN`：熔断，拒绝自动连接。
-- `HALF_OPEN`：只允许一个探测连接。
-- 探测成功回到 `READY`，失败重新进入 `OPEN`。
+- `OPEN`：连接已暂停，业务请求立即返回 `CONNECTION_PAUSED`。
+- `HALF_OPEN`：一次显式 reconnect 正在执行。
 
-### 失败分类
+## 错误行为
 
-- DNS、路由、拒绝连接、握手超时：网络连接失败。
-- host key 不匹配：安全错误，禁止自动重试。
-- Permission denied：认证错误，禁止自动重试。
-- banner/KEX reset：连接阶段错误，可进入冷却，但保护模式不立即重试。
-- 远端命令非零退出：业务结果，不计入连接失败。
-- 已执行命令后连接中断：状态不确定，绝不自动重放命令。
+- DNS、路由、拒绝连接、banner/KEX 和握手超时：首次失败后进入 `OPEN`。
+- host key 验证失败和 Permission denied：不自动重试，进入 `OPEN`。
+- ControlMaster 异常退出：下一个业务请求检测后进入 `OPEN`。
+- 远端命令普通非零退出：不计为连接故障。
+- 命令超时：只终止本地 SSH channel，并继续说明远端进程可能仍在运行。
+- Broker 模式不可用：返回 `BROKER_UNAVAILABLE`，不回退 direct。
 
-### 手动操作
-
-新增候选命令：
-
-```sh
-remote broker status
-remote broker reconnect
-remote broker pause
-remote broker resume
-```
-
-`reconnect` 只触发一次尝试。失败后继续保持熔断，不进入循环。
-
-### 配置
+## 配置
 
 ```json
 {
@@ -126,11 +115,24 @@ remote broker resume
 }
 ```
 
-## 验收标准
+`connect_retries` 本期只接受整数 `0`。`cooldown_max` 不得小于
+`cooldown_initial`。
 
-- 认证失败只产生一次连接尝试。
-- 20 个并发请求在断网时只触发一个探测连接。
-- 熔断期间请求不会创建 ssh 子进程。
-- 手动 reconnect 每次只尝试一次。
-- 命令状态不确定时不会自动重放。
-- 状态接口显示分类后的错误和连接尝试计数。
+## 操作
+
+```sh
+remote broker status
+remote broker reconnect
+```
+
+`status` 返回 `state`、`last_attempt_at`、`last_connected_at`、`last_error`、
+`failure_count` 和 `cooldown_until`。`reconnect` 不循环重试。
+
+## 验收结果
+
+- 坏端口首次失败后进入 `OPEN`，第二次业务请求返回 `CONNECTION_PAUSED`，且
+  `last_attempt_at` 不变。
+- 显式 reconnect 失败只增加一次 `failure_count`。
+- ControlMaster 退出后不会自动创建新 TCP；显式 reconnect 可恢复。
+- 认证和 host key 错误不会被 SFTP 客户端自动重试。
+- Broker 的 SFTP 和 Exec 路径均使用零次自动连接重试。

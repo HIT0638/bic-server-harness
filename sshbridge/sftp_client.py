@@ -37,9 +37,18 @@ def _is_connect_failure(err):
     if not isinstance(err, BridgeError) or err.code not in ("SSH_ERROR", "TIMEOUT"):
         return False
     text = err.message.lower()
+    terminal = (
+        "permission denied",
+        "host key verification failed",
+        "remote host identification has changed",
+        "no matching host key type found",
+        "too many authentication failures",
+    )
+    if any(marker in text for marker in terminal):
+        return False
     markers = ("connection closed", "connection reset", "connection refused",
                "connection timed out", "kex_exchange_identification",
-               "banner exchange", "unexpectedly")
+               "banner exchange")
     return any(m in text for m in markers)
 
 

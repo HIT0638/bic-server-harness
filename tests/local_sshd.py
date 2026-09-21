@@ -163,6 +163,16 @@ class LocalSshd:
             "batch_mode": True,
             "strict_host_key": "accept-new" if self.persistent else "no",
             "ssh_args": ssh_args,
+            "connection_policy": {
+                "mode": "broker",
+                "exec_concurrency": 2,
+                "min_connect_interval": 0.05,
+                "connect_retries": 0,
+                "auto_reconnect": False,
+                "cooldown_initial": 0,
+                "cooldown_max": 0,
+                "control_master": True,
+            },
         }
         self._wait_until_ready(ssh, username, client_key)
 
@@ -268,6 +278,27 @@ class LocalSshd:
                 pass
 
     def _shutdown_bridge_daemon(self):
+        if self.daemon_state is not None and self.daemon_state.is_dir():
+            for metadata_path in self.daemon_state.glob("b-*.json"):
+                try:
+                    metadata = json.loads(metadata_path.read_text(
+                        encoding="utf-8"))
+                    request = {
+                        "version": metadata["protocol_version"],
+                        "request_id": "local-sshd-cleanup",
+                        "profile": metadata["profile_fingerprint"],
+                        "op": "shutdown",
+                        "args": {},
+                    }
+                    with socket.socket(
+                            socket.AF_UNIX, socket.SOCK_STREAM) as broker:
+                        broker.settimeout(0.5)
+                        broker.connect(metadata["socket_path"])
+                        broker.sendall(
+                            (json.dumps(request) + "\n").encode("utf-8"))
+                        broker.recv(4096)
+                except (KeyError, OSError, ValueError):
+                    pass
         if self.daemon_port is None:
             return
         try:
@@ -314,14 +345,14 @@ def main(argv=None):
             print("  %s %s --config %s ls /"
                   % (sys.executable, PROJECT_ROOT / "remote.py",
                      server.config_path))
-        print("Daemon 测试命令:")
+        print("Broker 测试命令:")
         if args.persistent:
             print("  SSHBRIDGE_STATE_DIR=%s %s %s --profile local-test "
-                  "daemon start"
+                  "broker start"
                   % (server.daemon_state, sys.executable,
                      PROJECT_ROOT / "remote.py"))
         else:
-            print("  SSHBRIDGE_STATE_DIR=%s %s %s --config %s daemon start"
+            print("  SSHBRIDGE_STATE_DIR=%s %s %s --config %s broker start"
                   % (server.daemon_state, sys.executable,
                      PROJECT_ROOT / "remote.py", server.config_path))
         print("按 Ctrl-C 停止。")

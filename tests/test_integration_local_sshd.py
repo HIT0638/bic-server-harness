@@ -4,10 +4,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from sshbridge import ops
+from sshbridge.broker_client import BrokerClient
 from sshbridge.config import Profile
 from sshbridge.errors import BridgeError
 from sshbridge.sftp_client import SftpSession
@@ -214,6 +217,207 @@ class TestLocalSshdIntegration(unittest.TestCase):
             self.assertGreaterEqual(state["ops_served"], 1)
         finally:
             self.run_cli("--json", "daemon", "stop", env=env)
+
+    def test_broker_reuses_tcp_and_separates_exec_from_sftp(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        client = BrokerClient(str(self.server.config_path), self.profile)
+        errors = []
+        results = []
+        try:
+            client.ensure_started()
+            for _ in range(100):
+                client.request("list_dir", {"path": "/"})
+            self.assertEqual(client.status()["tcp_generation"], 1)
+
+            def execute(label):
+                try:
+                    result = client.request("exec", {
+                        "command": "sleep 0.8; printf %s" % label,
+                        "cwd": "/",
+                        "timeout": 3,
+                    })
+                    results.append(result["stdout"])
+                except Exception as error:
+                    errors.append(error)
+
+            threads = [
+                threading.Thread(target=execute, args=(label,))
+                for label in ("one", "two", "three")
+            ]
+            for thread in threads:
+                thread.start()
+
+            deadline = time.monotonic() + 2
+            queued = False
+            while time.monotonic() < deadline:
+                status = client.status()
+                if status["active_exec"] == 2 \
+                        and status["queued_exec"] == 1:
+                    queued = True
+                    break
+                time.sleep(0.02)
+            self.assertTrue(queued, client.status())
+
+            started = time.monotonic()
+            listed = client.request("list_dir", {"path": "/"})
+            self.assertEqual(listed["op"], "list_dir")
+            self.assertLess(time.monotonic() - started, 0.6)
+
+            for thread in threads:
+                thread.join(timeout=5)
+            self.assertFalse(errors)
+            self.assertEqual(sorted(results), ["one", "three", "two"])
+            status = client.status()
+            self.assertEqual(status["tcp_generation"], 1)
+            self.assertEqual(status["active_exec"], 0)
+            self.assertEqual(status["queued_exec"], 0)
+        finally:
+            client.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    def test_broker_pauses_after_master_exit_until_reconnect(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        client = BrokerClient(str(self.server.config_path), self.profile)
+        try:
+            client.ensure_started()
+            client.request("list_dir", {"path": "/"})
+            initial = client.status()
+            self.assertEqual(initial["tcp_generation"], 1)
+
+            subprocess.run(
+                self.profile.control_argv(
+                    client.endpoint.control_path, "exit"),
+                capture_output=True, timeout=5)
+            deadline = time.monotonic() + 2
+            while os.path.exists(client.endpoint.control_path) \
+                    and time.monotonic() < deadline:
+                time.sleep(0.02)
+
+            with self.assertRaises(BridgeError) as caught:
+                client.request("list_dir", {"path": "/"})
+            self.assertEqual(caught.exception.code, "CONNECTION_PAUSED")
+            self.assertEqual(client.status()["state"], "OPEN")
+
+            time.sleep(0.06)
+            reconnected = client.reconnect()
+            self.assertEqual(reconnected["state"], "READY")
+            self.assertEqual(reconnected["tcp_generation"], 2)
+            self.assertEqual(
+                client.request("list_dir", {"path": "/"})["op"],
+                "list_dir")
+        finally:
+            client.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    def test_broker_first_failure_opens_circuit_without_auto_retry(self):
+        bad_config = self.server.base / "bridge.bad.json"
+        bad_profile_raw = dict(self.server.profile_raw)
+        bad_profile_raw["port"] = 1
+        bad_policy = dict(bad_profile_raw["connection_policy"])
+        bad_policy["cooldown_initial"] = 60
+        bad_policy["cooldown_max"] = 60
+        bad_profile_raw["connection_policy"] = bad_policy
+        with open(bad_config, "w", encoding="utf-8") as stream:
+            json.dump({
+                "default_profile": "bad",
+                "profiles": {"bad": bad_profile_raw},
+            }, stream)
+        bad_profile = Profile("bad", bad_profile_raw)
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        client = BrokerClient(str(bad_config), bad_profile)
+        try:
+            client.ensure_started()
+            with self.assertRaises(BridgeError) as first:
+                client.request("list_dir", {"path": "/"})
+            self.assertIn(first.exception.code, ("SSH_ERROR", "TIMEOUT"))
+            opened = client.status()
+            self.assertEqual(opened["state"], "OPEN")
+            self.assertEqual(opened["failure_count"], 1)
+            attempted_at = opened["last_attempt_at"]
+
+            with self.assertRaises(BridgeError) as second:
+                client.request("list_dir", {"path": "/"})
+            self.assertEqual(second.exception.code, "CONNECTION_PAUSED")
+            paused = client.status()
+            self.assertEqual(paused["failure_count"], 1)
+            self.assertEqual(paused["last_attempt_at"], attempted_at)
+            self.assertGreater(paused["cooldown_until"], time.time() + 50)
+
+            time.sleep(0.06)
+            with self.assertRaises(BridgeError) as retry:
+                client.reconnect()
+            self.assertIn(retry.exception.code, ("SSH_ERROR", "TIMEOUT"))
+            self.assertEqual(client.status()["failure_count"], 2)
+        finally:
+            client.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    def test_broker_without_controlmaster_serializes_exec(self):
+        direct_config = self.server.base / "bridge.no-mux.json"
+        direct_profile_raw = dict(self.server.profile_raw)
+        policy = dict(direct_profile_raw["connection_policy"])
+        policy["control_master"] = False
+        policy["min_connect_interval"] = 0
+        direct_profile_raw["connection_policy"] = policy
+        with open(direct_config, "w", encoding="utf-8") as stream:
+            json.dump({
+                "default_profile": "no-mux",
+                "profiles": {"no-mux": direct_profile_raw},
+            }, stream)
+        direct_profile = Profile("no-mux", direct_profile_raw)
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        client = BrokerClient(str(direct_config), direct_profile)
+        results = []
+        try:
+            client.ensure_started()
+            client.request("list_dir", {"path": "/"})
+            initial = client.status()
+            self.assertFalse(initial["multiplexing"])
+            self.assertEqual(initial["exec_concurrency"], 1)
+            self.assertIn("disabled", initial["degraded_reason"])
+            self.assertEqual(initial["tcp_generation"], 1)
+
+            def execute(label):
+                results.append(client.request("exec", {
+                    "command": "sleep 0.3; printf %s" % label,
+                    "cwd": "/",
+                    "timeout": 2,
+                })["stdout"])
+
+            started = time.monotonic()
+            threads = [
+                threading.Thread(target=execute, args=(label,))
+                for label in ("one", "two")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, 0.5)
+            self.assertEqual(sorted(results), ["one", "two"])
+            status = client.status()
+            self.assertEqual(status["tcp_generation"], 3)
+            self.assertEqual(status["active_exec"], 0)
+        finally:
+            client.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
 
     def run_cli(self, *arguments, env=None):
         return subprocess.run(
