@@ -1,55 +1,47 @@
-# SSH Remote Workspace Bridge
+# SSH 远程工作区桥接
 
-SSH Remote Workspace Bridge is a small local CLI that lets a coding agent work
-with one remote Linux workspace through standard OpenSSH and SFTP.
+SSH Remote Workspace Bridge 是一个本地 CLI。它让本地运行的 Coding Agent
+通过标准 OpenSSH 与 SFTP 操作单个远程 Linux 工作区。
 
-It exists for older servers that cannot run VS Code Remote, Cursor Remote,
-Trae Remote, or another modern remote agent server. The remote host needs only
-an SSH server with an SFTP subsystem and a shell. It does not need Node.js, a
-new glibc version, or an agent runtime.
+项目面向无法运行 VS Code Remote、Cursor Remote、Trae Remote 等现代远程
+服务端的老旧服务器。远端只需提供带 SFTP 子系统的 SSH 服务和 shell；不需要
+Node.js、新版 glibc 或 Agent Runtime。
 
-The project is not an agent framework. It does not manage LLM calls, planning,
-agent loops, or context. It exposes remote filesystem and command operations
-for an agent already running locally.
+本项目不是 Agent Framework。不管理 LLM 调用、规划、Agent Loop 或上下文。
+它只提供本地 Agent 所需的远程文件系统和命令执行能力。
 
-## Features
+## 功能
 
-- `ls`, `stat`, `read`, `write`, `mkdir`, and `mv` over SFTP.
-- `exec` through the system `ssh` client with structured stdout, stderr, exit
-  code, and timeout status.
-- A configured workspace root. Filesystem paths are virtual paths: `/` maps to
-  that root, not to remote server root.
-- Lexical traversal clamping and post-`REALPATH` containment checks for
-  filesystem operations.
-- Atomic temporary-file replacement when the server supports
-  `posix-rename@openssh.com`.
-- Optional mtime, size, and SHA-256 conflict checks before writes.
-- Read-size limits and optional offset/limit reads.
-- Reuse of the user's SSH configuration, SSH agent, `ProxyJump`, known hosts,
-  and OpenSSH multiplexing where supported.
-- Optional local daemon that retains one SFTP session for repeated file
-  operations.
+- 经由 SFTP 提供 `ls`、`stat`、`read`、`write`、`mkdir` 与 `mv`。
+- 经由系统 `ssh` 提供 `exec`，返回结构化 stdout、stderr、退出码和超时状态。
+- 配置工作区根目录。文件路径均为虚拟路径：`/` 映射到该目录，不是远端系统根目录。
+- 文件操作执行词法路径收敛及 `REALPATH` 后的根目录包含性检查。
+- 服务端支持 `posix-rename@openssh.com` 时，使用临时文件完成原子替换。
+- 写入前可选 mtime、文件大小与 SHA-256 冲突检查。
+- 限制单次读取大小，并支持 offset/limit 分段读取。
+- 复用用户 SSH 配置、SSH Agent、`ProxyJump`、known hosts 与支持的
+  OpenSSH 连接复用。
+- 可选本地 daemon，为重复文件操作保留一个 SFTP 会话。
 
-## Requirements
+## 前置条件
 
-- Python 3.
-- Local OpenSSH client available as `ssh`.
-- Remote `sshd` with SFTP subsystem enabled.
-- `sha256sum` on remote host only when using `hash` or
-  `write --expected-hash`.
+- Python 3。
+- 本地可执行 `ssh` 的 OpenSSH 客户端。
+- 远端 `sshd` 已启用 SFTP 子系统。
+- 仅使用 `hash` 或 `write --expected-hash` 时，远端需要 `sha256sum`。
 
-No third-party Python packages are required.
+无需第三方 Python 依赖。
 
-## Setup
+## 配置
 
-Create a local configuration from the example:
+从示例创建本地配置：
 
 ```sh
 cp bridge.example.json bridge.json
 ```
 
-Set `host`, `port`, `user`, and `root`. `host` can be an alias defined in
-`~/.ssh/config`.
+设置 `host`、`port`、`user` 和 `root`。`host` 可使用 `~/.ssh/config`
+中定义的别名。
 
 ```json
 {
@@ -73,12 +65,11 @@ Set `host`, `port`, `user`, and `root`. `host` can be an alias defined in
 }
 ```
 
-`bridge.json` is intentionally ignored by Git. It is local machine and remote
-environment configuration.
+`bridge.json` 已被 Git 忽略。它用于保存本机与远端环境配置。
 
-## CLI
+## CLI 使用
 
-Run through the root wrapper:
+通过根目录包装脚本运行：
 
 ```sh
 python3 remote.py --config bridge.json ls /
@@ -92,18 +83,18 @@ python3 remote.py --config bridge.json mv /build/a.txt /build/b.txt
 python3 remote.py --config bridge.json exec --cwd / -- python3 src/main.py
 ```
 
-Use `--json` for structured output:
+使用 `--json` 获取结构化输出：
 
 ```sh
 python3 remote.py --config bridge.json --json ls /
 python3 remote.py --config bridge.json --json exec --cwd / -- python3 src/main.py
 ```
 
-`read` writes raw bytes to stdout in normal mode. JSON mode includes both
-UTF-8 replacement text and Base64 data.
+普通模式下，`read` 将原始字节写入 stdout。JSON 模式同时返回 UTF-8 替换文本
+与 Base64 数据。
 
-For optimistic concurrency, save `mtime` and `size` from `stat` or `read`,
-then supply them to `write`:
+要启用乐观并发控制，先从 `stat` 或 `read` 保存 `mtime` 与 `size`，
+再传给 `write`：
 
 ```sh
 python3 remote.py --config bridge.json write /src/main.py \
@@ -114,8 +105,7 @@ python3 remote.py --config bridge.json write /src/main.py \
 
 ## Daemon
 
-The optional daemon retains one SFTP connection. It reduces new SSH
-connections when the remote path rate-limits them.
+可选 daemon 保留一个 SFTP 连接。远端路径限制新建 SSH 连接时，可减少连接次数。
 
 ```sh
 python3 remote.py --config bridge.json daemon start
@@ -123,51 +113,44 @@ python3 remote.py --config bridge.json daemon status
 python3 remote.py --config bridge.json daemon stop
 ```
 
-The daemon serves one profile at a time. Current implementation uses an
-unauthenticated localhost TCP port. Run it only on a trusted single-user local
-environment until it is replaced with a permission-protected Unix socket or
-authenticated local protocol.
+daemon 一次只服务一个 profile。当前实现使用未认证的 localhost TCP 端口。
+在改为权限受控的 Unix socket 或带认证的本地协议前，只应在可信单用户环境运行。
 
-## Safety Boundaries
+## 安全边界
 
-Filesystem operations treat configured `root` as workspace root. `root` cannot
-be `/`. The bridge resolves symlinks through SFTP and rejects paths that end
-outside the canonical workspace root.
+文件操作将配置的 `root` 视为工作区根目录，且 `root` 不可为 `/`。桥接层通过
+SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的路径。
 
-`exec` is different: it starts command execution in requested workspace
-directory, but accepts arbitrary shell text by design. A command can still
-access other remote paths. Full command sandboxing requires remote account,
-container, chroot, or `sshd` policy; this bridge cannot guarantee it locally.
+`exec` 不同：它在指定工作区目录启动命令，但设计上接受任意 shell 文本。命令仍可
+访问其他远端路径。完整命令沙箱需要远端账户、容器、chroot 或 `sshd` 策略；
+本桥接层无法在本地保证此限制。
 
-On timeout, local `ssh` process is killed. Remote process may remain running.
-On servers without `posix-rename@openssh.com`, overwrite fallback is not
-atomic.
+超时时会终止本地 `ssh` 进程，远端进程仍可能继续运行。未提供
+`posix-rename@openssh.com` 的服务器会使用非原子的覆盖回退路径。
 
-## Architecture
+## 架构
 
-- `sshbridge/cli.py`: argument parsing, rendering, daemon routing.
-- `sshbridge/ops.py`: reusable JSON-ready bridge operation API.
-- `sshbridge/paths.py`: virtual-path normalization and root containment.
-- `sshbridge/sftp_client.py`: SFTP v3 client over `ssh -s sftp`.
-- `sshbridge/sftp_proto.py`: SFTP packet codec.
-- `sshbridge/exec_client.py`: remote command execution through `ssh`.
-- `sshbridge/daemon.py`: optional persistent local SFTP daemon.
-- `sshbridge/config.py`: profile parsing and OpenSSH invocation options.
+- `sshbridge/cli.py`：参数解析、结果渲染、daemon 路由。
+- `sshbridge/ops.py`：可复用且 JSON 就绪的桥接操作 API。
+- `sshbridge/paths.py`：虚拟路径规范化与根目录包含性检查。
+- `sshbridge/sftp_client.py`：运行于 `ssh -s sftp` 的 SFTP v3 客户端。
+- `sshbridge/sftp_proto.py`：SFTP 报文编解码。
+- `sshbridge/exec_client.py`：通过 `ssh` 执行远端命令。
+- `sshbridge/daemon.py`：可选的常驻本地 SFTP daemon。
+- `sshbridge/config.py`：profile 解析与 OpenSSH 调用选项。
 
-`ops.py` is intended to become the backend for future MCP tools. Keep new
-transport frontends thin and reuse these operation functions.
+`ops.py` 将作为未来 MCP tools 的后端。新增传输层入口应保持轻量，并复用这些操作函数。
 
-## Tests
+## 测试
 
 ```sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q sshbridge remote.py
 ```
 
-Current tests cover path normalization, SFTP packet encoding, and connection
-failure classification. Add mock or disposable-host integration tests before
-declaring CLI behavior stable.
+当前测试覆盖路径规范化、SFTP 报文编解码和连接失败分类。在宣布 CLI 行为稳定前，
+应补充 mock 或一次性测试主机的集成测试。
 
-## Status
+## 状态
 
-CLI MVP is implemented. MCP server wrapping remains future work.
+CLI MVP 已实现。MCP Server 封装仍是后续工作。

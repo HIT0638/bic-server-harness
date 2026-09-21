@@ -1,89 +1,76 @@
-# Agent Guide
+# Agent 指南
 
-## Scope
+## 范围
 
-This repository provides a thin remote filesystem and command execution bridge
-for a coding agent that already runs locally.
+本仓库为已在本地运行的 Coding Agent 提供轻量的远程文件系统和命令执行桥接层。
 
-Do not add LLM orchestration, planning, agent loops, context management, or a
-remote agent runtime. The remote host may be an old Linux server with glibc
-2.17. Assume only OpenSSH, SFTP, and a shell exist remotely.
+不得加入 LLM 编排、规划、Agent Loop、上下文管理或远程 Agent Runtime。远端可能是
+glibc 2.17 的老旧 Linux 服务器；只假定远端存在 OpenSSH、SFTP 与 shell。
 
-## Design Rules
+## 设计规则
 
-- Use SFTP for filesystem operations.
-- Use local system OpenSSH for command execution.
-- Reuse `~/.ssh/config`, SSH agent, `ProxyJump`, known hosts, and supported
-  OpenSSH connection multiplexing. Do not reimplement SSH authentication.
-- Do not require a remote binary, Node.js, Python package, daemon, or modern
-  glibc.
-- Keep directory access lazy. Never recursively scan a server or depend on
-  long-running `tree`.
-- Keep `sshbridge/ops.py` transport-neutral. CLI and future MCP handlers call
-  this API rather than duplicate operation logic.
+- 文件操作使用 SFTP。
+- 命令执行使用本地系统 OpenSSH。
+- 复用 `~/.ssh/config`、SSH Agent、`ProxyJump`、known hosts 和支持的 OpenSSH
+  连接复用。不得重写 SSH 认证。
+- 不得要求远端安装二进制文件、Node.js、Python 包、daemon 或新版 glibc。
+- 目录访问必须懒加载。不得递归扫描远端，也不得依赖长期运行的 `tree`。
+- `sshbridge/ops.py` 必须保持传输层无关。CLI 与未来 MCP handler 应调用它，
+  不得重复实现操作逻辑。
 
-## Filesystem Safety
+## 文件系统安全
 
-- `Profile.root` must be an absolute remote path and must never be `/`.
-- Treat bridge paths as virtual workspace paths. `/` maps to `Profile.root`.
-- Normalize `.` and `..` before remote access.
-- For every filesystem operation, canonicalize remote path with SFTP
-  `REALPATH` where target exists, then verify containment under canonical root.
-- Preserve root checks for source, destination, and parent directories.
-- Keep large reads bounded by `max_read_bytes` and `hard_read_cap`.
-- Write through a same-directory temporary file, then rename it. Do not replace
-  this with direct target writes.
-- Preserve conflict detection for expected mtime, size, and SHA-256 values.
-- Return stable `BridgeError` codes and JSON-ready error details.
+- `Profile.root` 必须是绝对远端路径，且不可为 `/`。
+- 桥接路径均是虚拟工作区路径，`/` 映射到 `Profile.root`。
+- 远端访问前规范化 `.` 和 `..`。
+- 每项文件系统操作中，存在的目标路径必须经 SFTP `REALPATH` 规范化，再验证其位于
+  规范根目录内。
+- 必须保留源、目标和父目录的根目录检查。
+- 大文件读取必须受 `max_read_bytes` 与 `hard_read_cap` 限制。
+- 写入必须先写入同目录临时文件，再重命名。不得改为直接写入目标文件。
+- 必须保留 expected mtime、size 与 SHA-256 的冲突检测。
+- 必须返回稳定的 `BridgeError` 错误码和 JSON 就绪的错误详情。
 
-## Command Safety
+## 命令安全
 
-`exec` accepts arbitrary shell text. Its `cwd` is a starting directory, not a
-security sandbox. Do not claim command-level containment unless remote account
-or `sshd` policy enforces it.
+`exec` 接受任意 shell 文本。其 `cwd` 是起始目录，不是安全沙箱。除非远端账户或
+`sshd` 策略提供强制隔离，不得宣称命令级路径约束。
 
-Keep stdout, stderr, exit code, and timeout state structured. Local SSH timeout
-does not prove remote process termination; preserve that warning in results.
+stdout、stderr、退出码和超时状态必须结构化返回。本地 SSH 超时不能证明远端进程已
+终止；结果中必须保留该提示。
 
-## Daemon Rules
+## Daemon 规则
 
-The daemon serializes access to one persistent SFTP session. Do not use that
-lock around standalone `exec` work, which does not access the SFTP session.
+daemon 串行访问一个常驻 SFTP 会话。不得在独立 `exec` 工作期间持有该锁，因为
+`exec` 不访问 SFTP 会话。
 
-Do not broaden daemon network exposure. Current localhost TCP protocol lacks
-caller authentication and is suitable only for trusted single-user local
-machines. Prefer a Unix socket with restrictive file permissions for future
-hardening.
+不得扩大 daemon 网络暴露面。当前 localhost TCP 协议未认证，仅适用于可信的单用户
+本机环境。后续加固优先使用具有限制权限的 Unix socket。
 
-## Compatibility
+## 兼容性
 
-- Stay within Python standard library unless a dependency removes substantial
-  protocol or security risk.
-- Keep SFTP v3 support. Older OpenSSH servers commonly expose it.
-- Treat `posix-rename@openssh.com` as an optional extension. If atomic
-  overwrite cannot be guaranteed, expose that fact rather than silently
-  promising atomicity.
-- `sha256sum` is not guaranteed by SSH, SFTP, or shell. Avoid making basic file
-  operations depend on it.
+- 除非依赖能显著降低协议或安全风险，否则只使用 Python 标准库。
+- 保持 SFTP v3 支持。老版本 OpenSSH 通常支持该版本。
+- 将 `posix-rename@openssh.com` 视为可选扩展。无法保证原子覆盖时，必须明确暴露
+  限制，不得静默承诺原子性。
+- SSH、SFTP 与 shell 不保证存在 `sha256sum`。不得让基础文件操作依赖它。
 
-## Tests
+## 测试
 
-Run before commit:
+提交前运行：
 
 ```sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q sshbridge remote.py
 ```
 
-Add tests for each behavior change. Prioritize operation-level tests with a
-mock SFTP transport or disposable SSH host for sandbox escapes, symlink
-handling, atomic-write behavior, conflict checks, timeouts, daemon routing, and
-CLI JSON output.
+每次行为改动都应新增测试。优先添加 mock SFTP transport 或一次性 SSH 测试主机的
+操作级测试，覆盖沙箱逃逸、符号链接、原子写入、冲突检查、超时、daemon 路由和
+CLI JSON 输出。
 
-## Repository Hygiene
+## 仓库规范
 
-- Keep `bridge.json` local. Track `bridge.example.json` only.
-- Never commit SSH keys, SSH configuration, host-specific credentials, daemon
-  PID files, logs, bytecode, or virtual environments.
-- Keep documentation factual. Update `README.md` when command syntax, security
-  boundary, configuration, or supported operation changes.
+- `bridge.json` 必须保留本地；只跟踪 `bridge.example.json`。
+- 不得提交 SSH 私钥、SSH 配置、主机专属凭据、daemon PID 文件、日志、字节码或
+  虚拟环境。
+- 文档必须保持事实准确。命令语法、安全边界、配置或支持操作变化时，更新 `README.md`。
