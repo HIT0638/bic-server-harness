@@ -2,7 +2,8 @@
 
 ## 状态
 
-已在 `feat/connection-broker` 分支实现首次失败熔断、连接门控和显式 reconnect。
+已在 `feat/connection-broker` 分支实现首次失败熔断、连接门控和显式 reconnect，
+核心实现提交为 `65d8063`。
 
 ## 背景
 

@@ -2,8 +2,8 @@
 
 ## 状态
 
-已在 `feat/connection-broker` 分支实现。覆盖 macOS/Linux；Windows named pipe、
-MCP 和 Rsync 不在本期范围。
+已在 `feat/connection-broker` 分支实现，核心实现提交为 `65d8063`。覆盖
+macOS/Linux；Windows named pipe、MCP 和 Rsync 不在本期范围。
 
 ## 背景
 

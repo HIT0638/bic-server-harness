@@ -2,8 +2,9 @@
 
 ## 状态
 
-POSIX Unix socket 方案已在 `feat/connection-broker` 分支实现。Windows named pipe
-尚未实现，Windows 不会回退到 localhost TCP Broker。
+POSIX Unix socket 方案已在 `feat/connection-broker` 分支实现，核心实现提交为
+`65d8063`。Windows named pipe 尚未实现，Windows 不会回退到 localhost TCP
+Broker。
 
 ## 背景
 
