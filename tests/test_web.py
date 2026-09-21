@@ -11,6 +11,9 @@ from sshbridge.web import create_server
 
 from tests.local_sshd import LocalSshd, LocalSshdUnavailable
 
+SENTINEL_NAME = ".sshbridge-web-sentinel.txt"
+SENTINEL_CONTENT = "sshbridge web sentinel\n"
+
 
 class TestWebExplorerIntegration(unittest.TestCase):
     @classmethod
@@ -18,6 +21,8 @@ class TestWebExplorerIntegration(unittest.TestCase):
         cls.sshd = LocalSshd()
         try:
             cls.sshd.start()
+            (cls.sshd.workspace / SENTINEL_NAME).write_text(
+                SENTINEL_CONTENT, encoding="utf-8")
             cls.profile = Profile("web-test", cls.sshd.profile_raw)
             cls.web = create_server(
                 cls.profile, port=0, token="test-token")
@@ -160,9 +165,9 @@ class TestWebExplorerIntegration(unittest.TestCase):
 
     def test_sandbox_error_and_request_limit(self):
         status, _, payload = self.request_json(
-            "/api/read?path=%2F..%2F..%2Fhello.txt")
+            "/api/read?path=%2F..%2F..%2F" + SENTINEL_NAME)
         self.assertEqual(status, 200, payload)
-        self.assertEqual(payload["content"], "hello from isolated sshd\n")
+        self.assertEqual(payload["content"], SENTINEL_CONTENT)
 
         status, _, payload = self.request_json(
             "/api/write", "POST", {

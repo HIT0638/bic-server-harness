@@ -20,6 +20,8 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_PY = PROJECT_ROOT / "remote.py"
+SENTINEL_NAME = ".sshbridge-integration-sentinel.txt"
+SENTINEL_CONTENT = b"sshbridge integration sentinel\n"
 
 
 class TestLocalSshdIntegration(unittest.TestCase):
@@ -28,6 +30,8 @@ class TestLocalSshdIntegration(unittest.TestCase):
         cls.server = LocalSshd()
         try:
             cls.server.start()
+            (cls.server.workspace / SENTINEL_NAME).write_bytes(
+                SENTINEL_CONTENT)
             cls.profile = Profile("local-test", cls.server.profile_raw)
             cls.session = SftpSession(
                 cls.profile.sftp_argv(), cls.profile.op_timeout)
@@ -131,10 +135,10 @@ class TestLocalSshdIntegration(unittest.TestCase):
             session=self.session)
 
         clamped = ops.op_read_file(
-            self.profile, "/../../hello.txt", session=self.session)
+            self.profile, "/../../" + SENTINEL_NAME, session=self.session)
         self.assertEqual(
             base64.b64decode(clamped["content_b64"]),
-            b"hello from isolated sshd\n")
+            SENTINEL_CONTENT)
 
     def test_read_limits_and_offsets(self):
         content = bytes(range(256)) * 16
@@ -175,13 +179,13 @@ class TestLocalSshdIntegration(unittest.TestCase):
         self.assertIn("remote process may still be running", timed_out["note"])
 
     def test_cli_json_round_trip(self):
-        read = self.run_cli("--json", "read", "/hello.txt")
+        read = self.run_cli("--json", "read", "/" + SENTINEL_NAME)
         self.assertEqual(read.returncode, 0, read.stderr)
         payload = json.loads(read.stdout)
         self.assertTrue(payload["ok"])
         self.assertEqual(
             base64.b64decode(payload["content_b64"]),
-            b"hello from isolated sshd\n")
+            SENTINEL_CONTENT)
 
         executed = self.run_cli(
             "--json", "exec", "--cwd", "/", "--", "printf", "cli-ok")
