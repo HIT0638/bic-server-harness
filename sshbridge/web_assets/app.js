@@ -26,6 +26,7 @@
     newFile: document.querySelector("#new-file"),
     newFolder: document.querySelector("#new-folder"),
     rename: document.querySelector("#rename-entry"),
+    deleteEntry: document.querySelector("#delete-entry"),
     fileMeta: document.querySelector("#file-meta"),
     operationStatus: document.querySelector("#operation-status"),
     toast: document.querySelector("#toast"),
@@ -37,6 +38,7 @@
     selectedPath: "/",
     selectedType: "dir",
     currentFile: null,
+    displayedPath: null,
     dirty: false,
     toastTimer: null,
   };
@@ -336,6 +338,7 @@
         size: result.size,
         content: result.content,
       };
+      state.displayedPath = path;
       state.dirty = false;
       elements.editor.value = result.content;
       elements.editor.hidden = false;
@@ -357,6 +360,7 @@
 
   function showReadonly(path, message) {
     state.currentFile = null;
+    state.displayedPath = path;
     state.dirty = false;
     elements.editor.hidden = true;
     elements.readonlyView.hidden = false;
@@ -365,6 +369,20 @@
     elements.emptyState.hidden = true;
     elements.currentPath.textContent = path;
     elements.fileMeta.textContent = message;
+    updateDirtyState();
+  }
+
+  function clearEditor() {
+    state.currentFile = null;
+    state.displayedPath = null;
+    state.dirty = false;
+    elements.editor.value = "";
+    elements.editor.hidden = true;
+    elements.readonlyView.hidden = true;
+    elements.fileView.hidden = true;
+    elements.emptyState.hidden = false;
+    elements.currentPath.textContent = "未打开文件";
+    elements.fileMeta.textContent = "就绪";
     updateDirtyState();
   }
 
@@ -502,9 +520,12 @@
         method: "POST",
         body: {src: oldPath, dst: destination},
       });
-      if (state.currentFile && state.currentFile.path === oldPath) {
-        state.currentFile.path = destination;
+      if (state.displayedPath === oldPath) {
+        state.displayedPath = destination;
         elements.currentPath.textContent = destination;
+        if (state.currentFile) {
+          state.currentFile.path = destination;
+        }
       }
       state.selectedPath = destination;
       const oldDirectory = state.directories.get(oldPath);
@@ -514,6 +535,42 @@
       }
       await refreshDirectory(parentPath(oldPath));
       showToast("已重命名");
+    } catch (error) {
+      showToast(errorMessage(error), true);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteSelected() {
+    if (state.selectedPath === "/") {
+      showToast("不能删除工作区根目录", true);
+      return;
+    }
+    const path = state.selectedPath;
+    const label = state.selectedType === "dir" ? "目录" : "文件";
+    if (!window.confirm(`确定删除${label}“${path}”？此操作不可撤销。`)) {
+      return;
+    }
+    const parent = parentPath(path);
+    setBusy("删除中");
+    try {
+      await api("/api/delete", {
+        method: "POST",
+        body: {path},
+      });
+      for (const cachedPath of state.directories.keys()) {
+        if (cachedPath === path || cachedPath.startsWith(`${path}/`)) {
+          state.directories.delete(cachedPath);
+        }
+      }
+      if (state.displayedPath === path) {
+        clearEditor();
+      }
+      state.selectedPath = parent;
+      state.selectedType = "dir";
+      await refreshDirectory(parent);
+      showToast(`${label}已删除`);
     } catch (error) {
       showToast(errorMessage(error), true);
     } finally {
@@ -562,6 +619,7 @@
   elements.newFile.addEventListener("click", createFile);
   elements.newFolder.addEventListener("click", createFolder);
   elements.rename.addEventListener("click", renameSelected);
+  elements.deleteEntry.addEventListener("click", deleteSelected);
   elements.reconnect.addEventListener("click", reconnect);
   window.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {

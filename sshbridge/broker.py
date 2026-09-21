@@ -159,7 +159,7 @@ class BrokerState:
     def run(self, op, arguments):
         if op not in {
                 "list_dir", "stat", "read_file", "write_file",
-                "mkdir", "move", "exec", "hash"}:
+                "mkdir", "move", "delete", "exec", "hash"}:
             raise BridgeError(
                 "INVALID_ARG", "unknown broker operation: %s" % op)
         with self.state_lock:
@@ -235,6 +235,9 @@ class BrokerState:
             return ops.op_move(
                 self.profile, arguments["src"], arguments["dst"],
                 force=bool(arguments.get("force")), session=session)
+        if op == "delete":
+            return ops.op_delete(
+                self.profile, arguments["path"], session=session)
         if op == "hash":
             return ops.op_hash(
                 self.profile, arguments["path"], session=session,

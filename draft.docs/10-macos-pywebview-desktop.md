@@ -355,7 +355,7 @@ pywebview window API 增加，不改变 Broker 协议。
 
 ### 实际验证结果
 
-- Apple Python `3.9.6` 与 Homebrew Python `3.12.14` 均通过完整 85 项测试。
+- Apple Python `3.9.6` 与 Homebrew Python `3.12.14` 均通过完整 86 项测试。
 - `python3 -m compileall`、`node --check sshbridge/web_assets/app.js` 与
   `git diff --check` 通过。
 - 开发入口已启动真实 Cocoa 窗口；页面完成加载，未保存标记在编辑后由 `false`

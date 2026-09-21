@@ -92,6 +92,7 @@ class TestWebExplorerIntegration(unittest.TestCase):
         status, headers, raw = self.request("/", token=None)
         self.assertEqual(status, 200)
         self.assertIn(b"Remote Explorer", raw)
+        self.assertIn(b'id="delete-entry"', raw)
         self.assertIn("default-src 'self'",
                       headers["Content-Security-Policy"])
 
@@ -193,6 +194,27 @@ class TestWebExplorerIntegration(unittest.TestCase):
             "/api/read?path=%2Fweb-flow%2Frenamed.txt")
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["content"], "second\n")
+
+        status, _, payload = self.request_json(
+            "/api/delete", "POST", {"path": base})
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["error"]["code"], "NOT_EMPTY")
+
+        status, _, payload = self.request_json(
+            "/api/delete", "POST", {"path": base + "/renamed.txt"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["type"], "file")
+        self.assertNotIn("real_path", payload)
+
+        status, _, payload = self.request_json(
+            "/api/delete", "POST", {"path": base})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["type"], "dir")
+
+        status, _, payload = self.request_json(
+            "/api/delete", "POST", {"path": "/"})
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["error"]["code"], "INVALID_ARG")
 
     def test_binary_file_is_not_exposed_as_editor_text(self):
         binary = self.sshd.workspace / "binary.dat"

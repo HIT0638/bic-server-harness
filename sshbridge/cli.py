@@ -82,6 +82,11 @@ def build_parser():
     p.add_argument("dst")
     p.add_argument("--force", action="store_true", help="overwrite existing destination")
 
+    p = sub.add_parser(
+        "rm", parents=[common],
+        help="delete a file, symlink, or empty directory")
+    p.add_argument("path")
+
     p = sub.add_parser("exec", parents=[common],
                        help="run a shell command remotely (structured result)")
     p.add_argument("--cwd", default="/", metavar="PATH",
@@ -173,6 +178,8 @@ def dispatch(args, profile):
         return ops.op_mkdir(profile, args.path, parents=args.parents), None
     if op == "mv":
         return ops.op_move(profile, args.src, args.dst, force=args.force), None
+    if op == "rm":
+        return ops.op_delete(profile, args.path), None
     if op == "exec":
         cmd = _exec_command_text(args)
         return ops.op_exec(profile, cmd, cwd=args.cwd, timeout=args.timeout), None
@@ -216,6 +223,8 @@ def _broker_build_request(args, profile):
             "move",
             {"src": args.src, "dst": args.dst, "force": args.force},
             120)
+    if op == "rm":
+        return "delete", {"path": args.path}, 120
     if op == "exec":
         t = args.timeout or profile.exec_timeout
         return (
@@ -294,6 +303,8 @@ def _render_text(args, r):
             print("source and destination are the same: %s" % r["real_path"])
         else:
             print("moved %s -> %s" % (r["src"], r["dst"]))
+    elif op == "rm":
+        print("deleted %s %s" % (r["type"], r["path"]))
     elif op == "hash":
         print("sha256:%s  %s" % (r["hash"], r["path"]))
     elif op in ("broker", "daemon"):

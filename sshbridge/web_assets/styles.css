@@ -207,6 +207,11 @@ button {
   outline: none;
 }
 
+.icon-button.danger:hover,
+.icon-button.danger:focus-visible {
+  color: var(--danger);
+}
+
 .tree {
   min-height: 0;
   overflow: auto;

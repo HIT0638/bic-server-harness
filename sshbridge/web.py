@@ -29,6 +29,7 @@ _ERROR_STATUS = {
     "NOT_FOUND": 404,
     "NOT_A_FILE": 409,
     "NOT_A_DIR": 409,
+    "NOT_EMPTY": 409,
     "EXISTS": 409,
     "CONFLICT": 409,
     "TOO_LARGE": 413,
@@ -127,6 +128,8 @@ class WorkspaceService:
                 "dst": args[1],
                 "force": bool(kwargs.get("force")),
             }
+        if function is ops.op_delete:
+            return "delete", {"path": args[0]}
         raise BridgeError("INVALID_ARG", "unsupported Web operation")
 
     def _get_session(self):
@@ -181,6 +184,8 @@ class ExplorerHandler(BaseHTTPRequestHandler):
                 return self._api_mkdir(payload)
             if parsed.path == "/api/move":
                 return self._api_move(payload)
+            if parsed.path == "/api/delete":
+                return self._api_delete(payload)
             if parsed.path == "/api/reconnect":
                 return self._json_ok(self.server.workspace.reconnect())
             return self._json_error(404, "NOT_FOUND", "route not found")
@@ -262,6 +267,12 @@ class ExplorerHandler(BaseHTTPRequestHandler):
         dst = _required_string(payload, "dst")
         result = self.server.workspace.call(
             ops.op_move, src, dst, force=bool(payload.get("force")))
+        result.pop("real_path", None)
+        return self._json_ok(result)
+
+    def _api_delete(self, payload):
+        path = _required_string(payload, "path")
+        result = self.server.workspace.call(ops.op_delete, path)
         result.pop("real_path", None)
         return self._json_ok(result)
 

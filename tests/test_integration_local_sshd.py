@@ -123,6 +123,33 @@ class TestLocalSshdIntegration(unittest.TestCase):
         self.assertEqual(names, ["moved.bin"])
         self.assertFalse(any(name.startswith(".sshbridge.tmp.") for name in names))
 
+    def test_delete_file_and_empty_directory(self):
+        directory = self.remote_case + "/delete"
+        path = directory + "/note.txt"
+        ops.op_mkdir(
+            self.profile, directory, session=self.session)
+        ops.op_write_file(
+            self.profile, path, b"delete me", session=self.session)
+
+        self.assert_bridge_error(
+            "NOT_EMPTY", ops.op_delete,
+            self.profile, directory, session=self.session)
+
+        deleted_file = ops.op_delete(
+            self.profile, path, session=self.session)
+        self.assertEqual(deleted_file["op"], "delete")
+        self.assertEqual(deleted_file["type"], "file")
+        self.assertFalse((self.local_case / "delete" / "note.txt").exists())
+
+        deleted_directory = ops.op_delete(
+            self.profile, directory, session=self.session)
+        self.assertEqual(deleted_directory["type"], "dir")
+        self.assertFalse((self.local_case / "delete").exists())
+
+        self.assert_bridge_error(
+            "INVALID_ARG", ops.op_delete,
+            self.profile, "/", session=self.session)
+
     def test_sandbox_blocks_symlink_escape_and_clamps_traversal(self):
         outside_file = self.server.outside / "secret.txt"
         outside_file.write_text("secret", encoding="utf-8")
@@ -136,6 +163,11 @@ class TestLocalSshdIntegration(unittest.TestCase):
             "SANDBOX_VIOLATION", ops.op_write_file,
             self.profile, self.remote_case + "/escape/new.txt", b"blocked",
             session=self.session)
+        self.assert_bridge_error(
+            "SANDBOX_VIOLATION", ops.op_delete,
+            self.profile, self.remote_case + "/escape",
+            session=self.session)
+        self.assertTrue(outside_file.exists())
 
         clamped = ops.op_read_file(
             self.profile, "/../../" + SENTINEL_NAME, session=self.session)
@@ -196,6 +228,14 @@ class TestLocalSshdIntegration(unittest.TestCase):
         payload = json.loads(executed.stdout)
         self.assertEqual(payload["stdout"], "cli-ok")
         self.assertEqual(payload["exit_code"], 0)
+
+        local_path = self.local_case / "cli-delete.txt"
+        local_path.write_text("delete me", encoding="utf-8")
+        deleted = self.run_cli(
+            "--json", "rm", self.remote_case + "/cli-delete.txt")
+        self.assertEqual(deleted.returncode, 0, deleted.stderr)
+        self.assertEqual(json.loads(deleted.stdout)["type"], "file")
+        self.assertFalse(local_path.exists())
 
     def test_daemon_lifecycle_and_routing(self):
         env = os.environ.copy()

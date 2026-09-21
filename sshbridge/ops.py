@@ -322,6 +322,36 @@ def op_move(profile, src, dst, force=False, session=None):
             "real_path": dfinal, "overwrote": dst_exists}
 
 
+def op_delete(profile, path, session=None):
+    with _maybe_session(profile, session) as s:
+        croot = _canon_root(s, profile)
+        real = resolve_virtual(path, profile.root)
+        if real == profile.root:
+            raise BridgeError(
+                "INVALID_ARG", "cannot delete the sandbox root")
+        parent = s.realpath(parent_of(real))
+        ensure_within_root(parent, croot)
+        _require_dir(s, parent, "parent directory")
+        target = join(parent, basename_of(real))
+        attrs = s.stat(target, follow=False)
+        canon = s.realpath(target)
+        ensure_within_root(canon, croot)
+        entry_type = P.file_type(attrs.get("perms"))
+        if entry_type == "dir":
+            if s.list_dir(target):
+                raise BridgeError(
+                    "NOT_EMPTY", "directory is not empty: %s" % path)
+            s.rmdir(target)
+        else:
+            s.remove(target)
+    return {
+        "op": "delete",
+        "path": path,
+        "real_path": target,
+        "type": entry_type,
+    }
+
+
 def op_exec(profile, command, cwd="/", timeout=None, exec_runner=None):
     """Run a shell command remotely.
 

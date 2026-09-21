@@ -320,6 +320,10 @@ class SftpSession:
         t, body = self._request(P.FXP_REMOVE, P.pstr(path))
         self._status(t, body, "remove")
 
+    def rmdir(self, path):
+        t, body = self._request(P.FXP_RMDIR, P.pstr(path))
+        self._status(t, body, "rmdir")
+
     # -- lifecycle ---------------------------------------------------------
 
     def shutdown(self):

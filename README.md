@@ -12,7 +12,7 @@ Node.js、新版 glibc 或 Agent Runtime。
 
 ## 功能
 
-- 经由 SFTP 提供 `ls`、`stat`、`read`、`write`、`mkdir` 与 `mv`。
+- 经由 SFTP 提供 `ls`、`stat`、`read`、`write`、`mkdir`、`mv` 与 `rm`。
 - 经由系统 `ssh` 提供 `exec`，返回结构化 stdout、stderr、退出码和超时状态。
 - 配置工作区根目录。文件路径均为虚拟路径：`/` 映射到该目录，不是远端系统根目录。
 - 文件操作执行词法路径收敛及 `REALPATH` 后的根目录包含性检查。
@@ -100,6 +100,7 @@ python3 remote.py --config bridge.json write /src/main.py --content "print('hell
 printf 'binary-safe input' | python3 remote.py --config bridge.json write /tmp/data.bin
 python3 remote.py --config bridge.json mkdir -p /build/output
 python3 remote.py --config bridge.json mv /build/a.txt /build/b.txt
+python3 remote.py --config bridge.json rm /build/b.txt
 python3 remote.py --config bridge.json exec --cwd / -- python3 src/main.py
 ```
 
@@ -143,7 +144,7 @@ python3 remote.py --config bridge.json serve --port 0 --no-open
 - 展开目录时才执行 `list_dir`，不会递归扫描远端。
 - 查看与编辑 UTF-8 文本文件。
 - 保存时使用 mtime 与文件大小检查远端并发修改。
-- 新建文件、新建目录、重命名和刷新。
+- 新建文件、新建目录、重命名、删除文件或空目录，以及刷新。
 - 二进制文件与超过 `max_read_bytes` 的文件只显示元数据，不进入编辑器。
 - CLI 与 Web 共用 Broker 持有的 SFTP channel，不另建独立 SSH TCP。
 - 连接熔断时显示“连接已暂停”，只能通过界面中的重新连接按钮恢复。
