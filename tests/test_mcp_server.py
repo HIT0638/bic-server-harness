@@ -46,6 +46,7 @@ class FakeBrokerClient:
         self.status_calls = 0
         self.reconnect_calls = 0
         self.stop_calls = 0
+        self.capability_calls = []
 
     def ensure_started(self):
         self.ensure_calls += 1
@@ -123,6 +124,38 @@ class FakeBrokerClient:
                 "exit_code": 0,
                 "timed_out": False,
             }
+        if operation == "exec_start":
+            return {
+                "op": operation,
+                "job_id": "job-one",
+                "state": "QUEUED",
+                "cwd": arguments["cwd"],
+                "real_cwd": "/srv/workspace",
+            }
+        if operation == "exec_status":
+            return {
+                "op": operation,
+                "job_id": arguments["job_id"],
+                "state": "RUNNING",
+                "cwd": "/",
+                "real_cwd": "/srv/workspace",
+                "events": [{
+                    "cursor": 2,
+                    "stream": "stdout",
+                    "text": "ok",
+                }],
+                "next_cursor": 2,
+                "has_more": False,
+                "output_truncated": False,
+                "process_pid": 123,
+            }
+        if operation == "exec_cancel":
+            return {
+                "op": operation,
+                "job_id": arguments["job_id"],
+                "state": "CANCELED",
+                "remote_termination_unknown": True,
+            }
         return {
             "op": operation,
             "path": path,
@@ -140,6 +173,10 @@ class FakeBrokerClient:
     def reconnect(self):
         self.reconnect_calls += 1
         return {"state": "READY", "tcp_generation": 2}
+
+    def require_capability(self, name):
+        self.capability_calls.append(name)
+        return {"capabilities": [name]}
 
     def stop(self):
         self.stop_calls += 1
@@ -268,7 +305,8 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
             [
                 "list_dir", "stat", "read_file", "hash_file",
                 "connection_status", "write_file", "mkdir", "move",
-                "delete", "exec", "reconnect",
+                "delete", "exec", "exec_start", "exec_status",
+                "exec_cancel", "reconnect",
             ],
         )
         by_name = {tool.name: tool for tool in listed.tools}
@@ -283,6 +321,15 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(by_name["mkdir"].annotations.destructive_hint)
         self.assertTrue(by_name["delete"].annotations.destructive_hint)
         self.assertTrue(by_name["exec"].annotations.open_world_hint)
+        self.assertFalse(
+            by_name["exec_start"].annotations.idempotent_hint)
+        self.assertTrue(
+            by_name["exec_status"].annotations.read_only_hint)
+        self.assertTrue(
+            by_name["exec_cancel"].annotations.idempotent_hint)
+        self.assertIn(
+            "remote process may still be running",
+            by_name["exec_cancel"].description)
         self.assertEqual(
             set(by_name["stat"].output_schema["required"]),
             {"ok", "result"})
@@ -305,6 +352,13 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
             ("move", {"src": "/a", "dst": "/b", "force": True}),
             ("delete", {"path": "/file"}),
             ("exec", {"command": "printf ok", "cwd": "/", "timeout": 2.5}),
+            ("exec_start", {
+                "command": "sleep 10", "cwd": "/", "timeout": 20,
+            }),
+            ("exec_status", {
+                "job_id": "job-one", "cursor": 1, "max_bytes": 1024,
+            }),
+            ("exec_cancel", {"job_id": "job-one"}),
         ]
         for name, arguments in calls:
             with self.subTest(tool=name):
@@ -314,6 +368,7 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("/srv/workspace", serialized)
                 self.assertNotIn("real_path", serialized)
                 self.assertNotIn("real_cwd", serialized)
+                self.assertNotIn("process_pid", serialized)
 
         status = await self.call_tool("connection_status", {})
         reconnect = await self.call_tool("reconnect", {})
@@ -325,7 +380,8 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
         operations = [call[0] for call in self.broker.calls]
         self.assertEqual(operations, [
             "list_dir", "stat", "read_file", "hash", "write_file",
-            "mkdir", "move", "delete", "exec",
+            "mkdir", "move", "delete", "exec", "exec_start",
+            "exec_status", "exec_cancel",
         ])
         read_call = self.broker.calls[2]
         self.assertEqual(
@@ -336,7 +392,8 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             base64.b64decode(write_call[1]["data_b64"]), b"hello")
         self.assertEqual(write_call[2], 300.0)
-        self.assertEqual(self.broker.calls[-1][2], 62.5)
+        self.assertEqual(self.broker.calls[8][2], 62.5)
+        self.assertEqual(len(self.broker.capability_calls), 3)
         self.assertEqual(self.broker.ensure_calls, 1)
         self.assertEqual(self.broker.stop_calls, 0)
 
@@ -432,6 +489,21 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
         _, payload = self.error_payload(invalid)
         self.assertEqual(payload["error"]["code"], "INVALID_ARG")
         self.assertEqual(len(self.broker.calls), before)
+
+        invalid_start = await self.call_tool(
+            "exec_start", {"command": "true", "timeout": 0})
+        self.assertTrue(invalid_start.is_error)
+        _, payload = self.error_payload(invalid_start)
+        self.assertEqual(payload["error"]["code"], "INVALID_ARG")
+
+        invalid_status = await self.call_tool(
+            "exec_status", {
+                "job_id": "job-one",
+                "max_bytes": mcp_server.EXEC_STATUS_MAX_BYTES + 1,
+            })
+        self.assertTrue(invalid_status.is_error)
+        _, payload = self.error_payload(invalid_status)
+        self.assertEqual(payload["error"]["code"], "INVALID_ARG")
 
 
 if __name__ == "__main__":

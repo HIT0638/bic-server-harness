@@ -70,6 +70,20 @@ class TestLocalSshdIntegration(unittest.TestCase):
             function(*args, **kwargs)
         self.assertEqual(caught.exception.code, code)
 
+    def wait_for_job(self, client, job_id, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        latest = None
+        while time.monotonic() < deadline:
+            latest = client.request("exec_status", {
+                "job_id": job_id,
+                "cursor": 0,
+                "max_bytes": 65536,
+            })
+            if predicate(latest):
+                return latest
+            time.sleep(0.02)
+        self.fail("job condition not reached; latest=%r" % latest)
+
     def test_filesystem_workflow_and_conflicts(self):
         nested = self.remote_case + "/nested"
         made = ops.op_mkdir(
@@ -328,6 +342,158 @@ class TestLocalSshdIntegration(unittest.TestCase):
             else:
                 os.environ["SSHBRIDGE_STATE_DIR"] = previous
 
+    def test_async_exec_incremental_queue_cancel_timeout_and_cli(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        client = BrokerClient(str(self.server.config_path), self.profile)
+        try:
+            client.ensure_started()
+            started_at = time.monotonic()
+            started = client.request("exec_start", {
+                "command": "printf first; sleep 0.3; printf second",
+                "cwd": self.remote_case,
+                "timeout": 3,
+            })
+            self.assertLess(time.monotonic() - started_at, 0.25)
+            first = self.wait_for_job(
+                client, started["job_id"],
+                lambda status: any(
+                    event["text"] == "first"
+                    for event in status["events"]))
+            self.assertEqual(first["state"], "RUNNING")
+            final = self.wait_for_job(
+                client, started["job_id"],
+                lambda status: status["state"] == "EXITED")
+            self.assertEqual(final["exit_code"], 0)
+            tail = client.request("exec_status", {
+                "job_id": started["job_id"],
+                "cursor": first["next_cursor"],
+                "max_bytes": 65536,
+            })
+            self.assertEqual(
+                "".join(event["text"] for event in tail["events"]),
+                "second")
+
+            running = [
+                client.request("exec_start", {
+                    "command": "sleep 5",
+                    "cwd": self.remote_case,
+                    "timeout": 10,
+                })
+                for _ in range(2)
+            ]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                snapshot = client.status()
+                if snapshot["active_exec"] == 2:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(client.status()["active_exec"], 2)
+            with self.assertRaises(BridgeError) as busy:
+                client.reconnect()
+            self.assertEqual(busy.exception.code, "BROKER_BUSY")
+
+            marker = self.local_case / "queued-marker"
+            queued = client.request("exec_start", {
+                "command": "printf created > queued-marker",
+                "cwd": self.remote_case,
+                "timeout": 3,
+            })
+            self.assertEqual(
+                client.request("exec_status", {
+                    "job_id": queued["job_id"],
+                })["state"],
+                "QUEUED")
+            queued_cancel = client.request(
+                "exec_cancel", {"job_id": queued["job_id"]})
+            self.assertEqual(queued_cancel["state"], "CANCELED")
+            self.assertFalse(
+                queued_cancel["remote_termination_unknown"])
+
+            for job in running:
+                canceled = client.request(
+                    "exec_cancel", {"job_id": job["job_id"]})
+                self.assertEqual(canceled["state"], "CANCELED")
+                self.assertTrue(
+                    canceled["remote_termination_unknown"])
+            time.sleep(0.1)
+            self.assertFalse(marker.exists())
+            self.assertEqual(
+                client.request("list_dir", {"path": "/"})["op"],
+                "list_dir")
+
+            timed = client.request("exec_start", {
+                "command": "printf before; sleep 5",
+                "cwd": self.remote_case,
+                "timeout": 0.1,
+            })
+            timed_status = self.wait_for_job(
+                client, timed["job_id"],
+                lambda status: status["state"] == "TIMED_OUT")
+            self.assertTrue(
+                timed_status["remote_termination_unknown"])
+            self.assertIn(
+                "before",
+                "".join(event["text"]
+                        for event in timed_status["events"]))
+
+            cli_start = self.run_cli(
+                "--json", "exec-start", "--cwd", self.remote_case,
+                "--", "printf", "cli-async", env=os.environ.copy())
+            self.assertEqual(cli_start.returncode, 0, cli_start.stderr)
+            cli_job_id = json.loads(cli_start.stdout)["job_id"]
+            deadline = time.monotonic() + 3
+            cli_status = None
+            while time.monotonic() < deadline:
+                completed = self.run_cli(
+                    "--json", "exec-status", cli_job_id,
+                    env=os.environ.copy())
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                cli_status = json.loads(completed.stdout)
+                if cli_status["state"] == "EXITED":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(cli_status["state"], "EXITED")
+            self.assertEqual(
+                "".join(event["text"]
+                        for event in cli_status["events"]),
+                "cli-async")
+            self.assertEqual(client.status()["tcp_generation"], 1)
+        finally:
+            client.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    def test_broker_shutdown_cancels_running_exec_job(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        client = BrokerClient(str(self.server.config_path), self.profile)
+        stopped = False
+        try:
+            client.ensure_started()
+            started = client.request("exec_start", {
+                "command": "sleep 5",
+                "cwd": self.remote_case,
+                "timeout": 10,
+            })
+            self.wait_for_job(
+                client, started["job_id"],
+                lambda status: status["state"] == "RUNNING")
+            result = client.stop()
+            stopped = True
+            self.assertTrue(result["stopped"])
+            self.assertEqual(result["canceled_exec_jobs"], 1)
+            self.assertTrue(result["remote_termination_unknown"])
+        finally:
+            if not stopped:
+                client.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
     def test_broker_pauses_after_master_exit_until_reconnect(self):
         previous = os.environ.get("SSHBRIDGE_STATE_DIR")
         os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
@@ -494,7 +660,7 @@ class TestLocalSshdIntegration(unittest.TestCase):
 
             async with Client(parameters) as first:
                 tools = await first.list_tools()
-                self.assertEqual(len(tools.tools), 11)
+                self.assertEqual(len(tools.tools), 14)
 
                 reconnected = await first.call_tool("reconnect", {})
                 self.assertFalse(reconnected.is_error)
@@ -565,6 +731,34 @@ class TestLocalSshdIntegration(unittest.TestCase):
                 self.assertNotIn(
                     "real_cwd", executed.structured_content["result"])
 
+                async_started = await first.call_tool(
+                    "exec_start",
+                    {
+                        "command": "printf mcp-first; sleep 0.2; "
+                                   "printf mcp-second",
+                        "cwd": directory,
+                        "timeout": 2,
+                    })
+                self.assertFalse(async_started.is_error)
+                async_job_id = (
+                    async_started.structured_content["result"]["job_id"])
+                first_page = None
+                for _ in range(100):
+                    first_page = await first.call_tool(
+                        "exec_status",
+                        {"job_id": async_job_id})
+                    if any(
+                            event["text"] == "mcp-first"
+                            for event in first_page.structured_content[
+                                "result"]["events"]):
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertEqual(
+                    first_page.structured_content["result"]["state"],
+                    "RUNNING")
+                cursor = first_page.structured_content[
+                    "result"]["next_cursor"]
+
                 conflict = await first.call_tool(
                     "write_file",
                     {
@@ -591,6 +785,25 @@ class TestLocalSshdIntegration(unittest.TestCase):
                         second_status.structured_content["result"][
                             "tcp_generation"],
                         1)
+                    async_status = None
+                    for _ in range(100):
+                        async_status = await second.call_tool(
+                            "exec_status",
+                            {
+                                "job_id": async_job_id,
+                                "cursor": cursor,
+                            })
+                        if async_status.structured_content[
+                                "result"]["state"] == "EXITED":
+                            break
+                        await asyncio.sleep(0.02)
+                    self.assertFalse(async_status.is_error)
+                    self.assertEqual(
+                        "".join(
+                            event["text"] for event in
+                            async_status.structured_content[
+                                "result"]["events"]),
+                        "mcp-second")
 
                 for path in (moved_path, binary_path, directory):
                     deleted = await first.call_tool(
