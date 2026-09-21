@@ -9,9 +9,10 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict, Literal, Optional, TypedDict
 
-from .broker_client import BrokerClient
+from .broker_client import BrokerClient, EXEC_JOBS_CAPABILITY
 from .config import Profile, load_config
 from .errors import BridgeError
+from .exec_jobs import EXEC_STATUS_MAX_BYTES
 
 
 MCP_MAX_RESULT_BYTES = 1024 * 1024
@@ -19,7 +20,10 @@ _READ_TIMEOUT = 300.0
 _WRITE_TIMEOUT = 300.0
 _FILE_TIMEOUT = 120.0
 _HASH_TIMEOUT = 300.0
-_PRIVATE_RESULT_KEYS = frozenset(("real_path", "real_cwd", "root"))
+_PRIVATE_RESULT_KEYS = frozenset((
+    "command", "process", "process_pid", "real_path", "real_cwd", "root",
+    "ssh_argv",
+))
 
 
 class _SuccessResult(TypedDict):
@@ -102,8 +106,12 @@ class _McpBrokerAdapter:
             self.config_path,
         )
 
-    async def call(self, operation, arguments, timeout):
+    async def call(
+            self, operation, arguments, timeout, required_capability=None):
         try:
+            if required_capability is not None:
+                await asyncio.to_thread(
+                    self.client.require_capability, required_capability)
             result = await asyncio.to_thread(
                 self.client.request, operation, arguments, timeout)
             return self._success(
@@ -211,6 +219,18 @@ def create_mcp_server(
         read_only_hint=False,
         destructive_hint=False,
         idempotent_hint=False,
+        open_world_hint=True,
+    )
+    exec_status_annotations = sdk.ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
+    )
+    exec_cancel_annotations = sdk.ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=True,
         open_world_hint=True,
     )
 
@@ -398,6 +418,75 @@ def create_mcp_server(
             "exec",
             {"command": command, "cwd": cwd, "timeout": timeout},
             request_timeout,
+        )
+
+    @server.tool(
+        description=(
+            "Start arbitrary shell text as a Broker-owned asynchronous remote "
+            "job. cwd is only the starting directory, not a command sandbox; "
+            "the command can access anything allowed to the remote account. "
+            "Cancellation or timeout only terminates the local SSH channel "
+            "and cannot prove the remote process stopped."),
+        annotations=exec_annotations,
+        structured_output=True,
+    )
+    async def exec_start(
+            command: str,
+            cwd: str = "/",
+            timeout: Optional[float] = None,
+    ) -> _SuccessResult:
+        if timeout is not None and timeout <= 0:
+            adapter.invalid("INVALID_ARG", "timeout must be > 0")
+        return await adapter.call(
+            "exec_start",
+            {"command": command, "cwd": cwd, "timeout": timeout},
+            _FILE_TIMEOUT,
+            required_capability=EXEC_JOBS_CAPABILITY,
+        )
+
+    @server.tool(
+        description=(
+            "Read one cursor-based output page and the current state of an "
+            "asynchronous remote Exec job."),
+        annotations=exec_status_annotations,
+        structured_output=True,
+    )
+    async def exec_status(
+            job_id: str,
+            cursor: int = 0,
+            max_bytes: int = EXEC_STATUS_MAX_BYTES,
+    ) -> _SuccessResult:
+        if max_bytes > EXEC_STATUS_MAX_BYTES:
+            adapter.invalid(
+                "INVALID_ARG",
+                "max_bytes must not exceed %d" % EXEC_STATUS_MAX_BYTES,
+                max_bytes=EXEC_STATUS_MAX_BYTES,
+            )
+        return await adapter.call(
+            "exec_status",
+            {
+                "job_id": job_id,
+                "cursor": cursor,
+                "max_bytes": max_bytes,
+            },
+            _FILE_TIMEOUT,
+            required_capability=EXEC_JOBS_CAPABILITY,
+        )
+
+    @server.tool(
+        description=(
+            "Cancel a queued or running asynchronous remote Exec job. For a "
+            "running job this only terminates the local SSH channel; the "
+            "remote process may still be running."),
+        annotations=exec_cancel_annotations,
+        structured_output=True,
+    )
+    async def exec_cancel(job_id: str) -> _SuccessResult:
+        return await adapter.call(
+            "exec_cancel",
+            {"job_id": job_id},
+            _FILE_TIMEOUT,
+            required_capability=EXEC_JOBS_CAPABILITY,
         )
 
     @server.tool(

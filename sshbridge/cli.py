@@ -7,7 +7,7 @@ import json
 import sys
 
 from . import ops
-from .broker_client import BrokerClient
+from .broker_client import BrokerClient, EXEC_JOBS_CAPABILITY
 from .config import Profile, load_config
 from .errors import BridgeError
 
@@ -96,6 +96,27 @@ def build_parser():
                    help="command line (quote it as one argument for exact spacing; "
                         "prefix with -- if it starts with a dash)")
 
+    p = sub.add_parser(
+        "exec-start", parents=[common],
+        help="start an asynchronous remote shell command")
+    p.add_argument("--cwd", default="/", metavar="PATH",
+                   help="working directory inside the sandbox (default: /)")
+    p.add_argument("--timeout", type=float, default=None, metavar="SEC")
+    p.add_argument("cmd", nargs=argparse.REMAINDER, metavar="COMMAND",
+                   help="command line (prefix with -- if it starts with a dash)")
+
+    p = sub.add_parser(
+        "exec-status", parents=[common],
+        help="read one status and output page for an Exec job")
+    p.add_argument("job_id", metavar="JOB_ID")
+    p.add_argument("--cursor", type=int, default=0, metavar="N")
+    p.add_argument("--max-bytes", type=int, default=65536, metavar="N")
+
+    p = sub.add_parser(
+        "exec-cancel", parents=[common],
+        help="cancel a queued or running Exec job")
+    p.add_argument("job_id", metavar="JOB_ID")
+
     p = sub.add_parser("hash", parents=[common],
                        help="sha256 of a remote file (for conflict checks)")
     p.add_argument("path")
@@ -183,6 +204,10 @@ def dispatch(args, profile):
     if op == "exec":
         cmd = _exec_command_text(args)
         return ops.op_exec(profile, cmd, cwd=args.cwd, timeout=args.timeout), None
+    if op in ("exec-start", "exec-status", "exec-cancel"):
+        raise BridgeError(
+            "BROKER_UNSUPPORTED",
+            "asynchronous Exec requires connection_policy.mode=broker")
     if op == "hash":
         return ops.op_hash(profile, args.path), None
     raise BridgeError("INVALID_ARG", "unknown command: %s" % op)
@@ -235,6 +260,26 @@ def _broker_build_request(args, profile):
                 "timeout": args.timeout,
             },
             t + 60)
+    if op == "exec-start":
+        return (
+            "exec_start",
+            {
+                "command": _exec_command_text(args),
+                "cwd": args.cwd,
+                "timeout": args.timeout,
+            },
+            120)
+    if op == "exec-status":
+        return (
+            "exec_status",
+            {
+                "job_id": args.job_id,
+                "cursor": args.cursor,
+                "max_bytes": args.max_bytes,
+            },
+            120)
+    if op == "exec-cancel":
+        return "exec_cancel", {"job_id": args.job_id}, 120
     if op == "hash":
         return "hash", {"path": args.path}, 300
     raise BridgeError("INVALID_ARG", "op not routable: %s" % op)
@@ -242,6 +287,8 @@ def _broker_build_request(args, profile):
 
 def _broker_dispatch(client, args, profile):
     client.ensure_started()
+    if args.op in ("exec-start", "exec-status", "exec-cancel"):
+        client.require_capability(EXEC_JOBS_CAPABILITY)
     operation, arguments, timeout = _broker_build_request(args, profile)
     result = client.request(operation, arguments, timeout=timeout)
     raw = base64.b64decode(result["content_b64"]) if args.op == "read" else None
@@ -317,6 +364,22 @@ def _render_text(args, r):
             sys.stderr.write(
                 "[bridge] command timed out after %ss (exit 124); "
                 "remote process may still be running\n" % r["timeout"])
+    elif op == "exec-start":
+        print("%s %s" % (r["job_id"], r["state"]))
+    elif op == "exec-status":
+        for event in r["events"]:
+            stream = (
+                sys.stdout if event["stream"] == "stdout" else sys.stderr)
+            stream.write(event["text"])
+        sys.stderr.write(
+            "\n[bridge] state=%s next_cursor=%s has_more=%s "
+            "output_truncated=%s\n"
+            % (r["state"], r["next_cursor"], r["has_more"],
+               r["output_truncated"]))
+    elif op == "exec-cancel":
+        print("%s %s" % (r["job_id"], r["state"]))
+        if r.get("remote_termination_unknown"):
+            print("[bridge] %s" % r["note"], file=sys.stderr)
 
 
 def main(argv=None):
