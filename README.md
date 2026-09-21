@@ -132,6 +132,27 @@ Web 服务固定绑定 `127.0.0.1`，不能通过参数改为外网地址。API 
 生成的随机 token。浏览器只使用虚拟工作区路径，API 不返回真实远端根路径或 SSH
 凭据。关闭 `remote serve` 后 token 立即失效。
 
+### 固定本地工作区
+
+手动开发可启动固定 localhost sshd，直接将 `only4test/` 作为远端根目录：
+
+```sh
+python3 tests/local_sshd.py --persistent
+```
+
+该模式固定监听 `127.0.0.1:22222`。首次启动会在被 Git 忽略的 `.local-sshd/`
+生成并保存测试密钥、known_hosts、PID 和日志。另开终端后使用 `bridge.json` 中的
+`local-test` profile：
+
+```sh
+python3 remote.py --profile local-test ls /
+python3 remote.py --profile local-test serve
+```
+
+该模式不创建工作区副本。CLI 和 Web 的写入、移动与新建操作会直接修改
+`only4test/`，Git 会正常显示这些变化。停止 sshd 不会删除密钥或工作区，下次启动
+继续使用同一个 profile。
+
 ## Daemon
 
 可选 daemon 保留一个 SFTP 连接。远端路径限制新建 SSH 连接时，可减少连接次数。

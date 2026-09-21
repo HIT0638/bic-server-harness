@@ -79,6 +79,9 @@ OpenSSH 工具存在但行为回归时必须测试失败。
 `only4test/` 保存版本化测试工作区。测试必须先复制其内容到临时工作区，再执行写入、
 移动或删除；不得直接修改测试夹具。
 
+`tests/local_sshd.py --persistent` 是人工开发模式，可通过固定 `local-test` profile
+直接读写 `only4test/`。该模式的修改是用户工作区变更，不得在自动测试中使用。
+
 ## 仓库规范
 
 - `bridge.json` 必须保留本地；只跟踪 `bridge.example.json`。

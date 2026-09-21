@@ -1,8 +1,8 @@
-"""Hermetic local OpenSSH server used by integration tests.
+"""Local OpenSSH server for integration tests and persistent manual use.
 
-The server runs as the current user on a random localhost port. It owns its
-host key, client key, authorized_keys file, workspace, daemon state, and bridge
-configuration. No system SSH configuration or user SSH files are changed.
+Temporary mode uses random ports and a copied workspace. Persistent mode uses
+fixed local state and exposes only4test directly. Neither mode changes system
+SSH configuration or user SSH files.
 """
 
 import argparse
@@ -17,6 +17,9 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PERSISTENT_PORT = 22222
 
 
 class LocalSshdUnavailable(RuntimeError):
@@ -44,7 +47,9 @@ def _free_port():
 
 
 class LocalSshd:
-    def __init__(self):
+    def __init__(self, persistent=False, port=None):
+        self.persistent = persistent
+        self.requested_port = port
         self._temp = None
         self.base = None
         self.workspace = None
@@ -70,21 +75,30 @@ class LocalSshd:
             raise LocalSshdUnavailable(
                 "missing OpenSSH tools: %s" % ", ".join(missing))
 
-        self._temp = tempfile.TemporaryDirectory(prefix="sshbridge-local-")
-        self.base = Path(self._temp.name)
-        self.workspace = self.base / "workspace"
+        if self.persistent:
+            self.base = PROJECT_ROOT / ".local-sshd"
+            self.workspace = PROJECT_ROOT / "only4test"
+            self.base.mkdir(mode=0o700, exist_ok=True)
+            self.workspace.mkdir(exist_ok=True)
+        else:
+            self._temp = tempfile.TemporaryDirectory(prefix="sshbridge-local-")
+            self.base = Path(self._temp.name)
+            self.workspace = self.base / "workspace"
+            self.workspace.mkdir(mode=0o700)
         self.outside = self.base / "outside"
         self.daemon_state = self.base / "daemon-state"
-        for path in (self.workspace, self.outside, self.daemon_state):
-            path.mkdir(mode=0o700)
-        fixture_root = Path(__file__).resolve().parents[1] / "only4test"
-        if fixture_root.is_dir():
-            shutil.copytree(fixture_root, self.workspace, dirs_exist_ok=True)
+        for path in (self.outside, self.daemon_state):
+            path.mkdir(mode=0o700, exist_ok=True)
+        if not self.persistent:
+            fixture_root = PROJECT_ROOT / "only4test"
+            if fixture_root.is_dir():
+                shutil.copytree(
+                    fixture_root, self.workspace, dirs_exist_ok=True)
 
         host_key = self.base / "host_key"
         client_key = self.base / "client_key"
-        self._generate_key(ssh_keygen, host_key)
-        self._generate_key(ssh_keygen, client_key)
+        self._ensure_key(ssh_keygen, host_key)
+        self._ensure_key(ssh_keygen, client_key)
         authorized_keys = self.base / "authorized_keys"
         shutil.copyfile(str(client_key) + ".pub", authorized_keys)
         os.chmod(self.base, 0o700)
@@ -92,7 +106,7 @@ class LocalSshd:
         os.chmod(client_key, 0o600)
         os.chmod(authorized_keys, 0o600)
 
-        self.sshd_port = _free_port()
+        self.sshd_port = self.requested_port or _free_port()
         self.daemon_port = _free_port()
         while self.daemon_port == self.sshd_port:
             self.daemon_port = _free_port()
@@ -123,11 +137,18 @@ class LocalSshd:
         ssh_args = [
             "-i", str(client_key),
             "-o", "IdentitiesOnly=yes",
-            "-o", "UserKnownHostsFile=/dev/null",
             "-o", "GlobalKnownHostsFile=/dev/null",
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",
         ]
+        if self.persistent:
+            ssh_args += [
+                "-o", "UserKnownHostsFile=%s" % (self.base / "known_hosts"),
+            ]
+        else:
+            ssh_args += [
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ControlMaster=no",
+                "-o", "ControlPath=none",
+            ]
         self.profile_raw = {
             "host": "127.0.0.1",
             "port": self.sshd_port,
@@ -140,24 +161,35 @@ class LocalSshd:
             "max_read_bytes": 1024,
             "hard_read_cap": 2048,
             "batch_mode": True,
-            "strict_host_key": "no",
+            "strict_host_key": "accept-new" if self.persistent else "no",
             "ssh_args": ssh_args,
         }
         self._wait_until_ready(ssh, username, client_key)
 
-        self.config_path = self.base / "bridge.local.json"
-        with open(self.config_path, "w", encoding="utf-8") as config_file:
-            json.dump({
-                "default_profile": "local-test",
-                "daemon_port": self.daemon_port,
-                "profiles": {"local-test": self.profile_raw},
-            }, config_file, indent=2)
-            config_file.write("\n")
+        if self.persistent:
+            self.config_path = PROJECT_ROOT / "bridge.json"
+        else:
+            self.config_path = self.base / "bridge.local.json"
+            with open(self.config_path, "w", encoding="utf-8") as config_file:
+                json.dump({
+                    "default_profile": "local-test",
+                    "daemon_port": self.daemon_port,
+                    "profiles": {"local-test": self.profile_raw},
+                }, config_file, indent=2)
+                config_file.write("\n")
 
         return self
 
     @staticmethod
-    def _generate_key(ssh_keygen, path):
+    def _ensure_key(ssh_keygen, path):
+        public_path = Path(str(path) + ".pub")
+        if path.is_file() and public_path.is_file():
+            return
+        for stale_path in (path, public_path):
+            try:
+                stale_path.unlink()
+            except FileNotFoundError:
+                pass
         completed = subprocess.run(
             [ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -229,6 +261,11 @@ class LocalSshd:
         if self._temp is not None:
             self._temp.cleanup()
             self._temp = None
+        elif self.base is not None:
+            try:
+                (self.base / "sshd.pid").unlink()
+            except FileNotFoundError:
+                pass
 
     def _shutdown_bridge_daemon(self):
         if self.daemon_port is None:
@@ -253,24 +290,41 @@ class LocalSshd:
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="启动隔离的本地 OpenSSH/SFTP 测试环境")
-    parser.parse_args(argv)
-    server = LocalSshd()
+    parser.add_argument(
+        "--persistent", action="store_true",
+        help="固定端口并直接使用 only4test，不删除密钥和工作区")
+    args = parser.parse_args(argv)
+    server = LocalSshd(
+        persistent=args.persistent,
+        port=PERSISTENT_PORT if args.persistent else None)
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         server.start()
-        project_root = Path(__file__).resolve().parents[1]
-        print("隔离测试环境已启动")
+        print("本地 SSH 环境已启动")
         print("配置文件: %s" % server.config_path)
         print("工作区: %s" % server.workspace)
         print("测试命令:")
-        print("  %s %s --config %s ls /"
-              % (sys.executable, project_root / "remote.py",
-                 server.config_path))
+        if args.persistent:
+            print("  %s %s --profile local-test ls /"
+                  % (sys.executable, PROJECT_ROOT / "remote.py"))
+            print("Web 命令:")
+            print("  %s %s --profile local-test serve"
+                  % (sys.executable, PROJECT_ROOT / "remote.py"))
+        else:
+            print("  %s %s --config %s ls /"
+                  % (sys.executable, PROJECT_ROOT / "remote.py",
+                     server.config_path))
         print("Daemon 测试命令:")
-        print("  SSHBRIDGE_STATE_DIR=%s %s %s --config %s daemon start"
-              % (server.daemon_state, sys.executable,
-                 project_root / "remote.py", server.config_path))
-        print("按 Ctrl-C 停止并清理。")
+        if args.persistent:
+            print("  SSHBRIDGE_STATE_DIR=%s %s %s --profile local-test "
+                  "daemon start"
+                  % (server.daemon_state, sys.executable,
+                     PROJECT_ROOT / "remote.py"))
+        else:
+            print("  SSHBRIDGE_STATE_DIR=%s %s %s --config %s daemon start"
+                  % (server.daemon_state, sys.executable,
+                     PROJECT_ROOT / "remote.py", server.config_path))
+        print("按 Ctrl-C 停止。")
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:

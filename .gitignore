@@ -9,6 +9,7 @@ venv/
 bridge.json
 .bridge-daemon.json
 .bridge-daemon.log
+.local-sshd/
 
 # Test and tool output
 .coverage
