@@ -1,5 +1,12 @@
 # 长命令执行
 
+## 状态
+
+同步 Exec 并发与 SFTP 隔离已实现；异步任务、增量输出和主动取消尚未实现。
+
+实施计划：
+`.trae/documents/long-running-commands-mvp-implementation-plan.md`。
+
 ## 背景
 
 构建、测试、日志分析和数据处理可能持续数分钟或更久。当前 `exec` 使用
