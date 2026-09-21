@@ -76,6 +76,9 @@ CLI JSON 输出。
 `bridge.json`、`~/.ssh` 或系统 SSH 配置。缺少 OpenSSH 工具时可跳过集成测试；
 OpenSSH 工具存在但行为回归时必须测试失败。
 
+`only4test/` 保存版本化测试工作区。测试必须先复制其内容到临时工作区，再执行写入、
+移动或删除；不得直接修改测试夹具。
+
 ## 仓库规范
 
 - `bridge.json` 必须保留本地；只跟踪 `bridge.example.json`。

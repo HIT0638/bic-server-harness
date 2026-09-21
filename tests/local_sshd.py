@@ -77,6 +77,9 @@ class LocalSshd:
         self.daemon_state = self.base / "daemon-state"
         for path in (self.workspace, self.outside, self.daemon_state):
             path.mkdir(mode=0o700)
+        fixture_root = Path(__file__).resolve().parents[1] / "only4test"
+        if fixture_root.is_dir():
+            shutil.copytree(fixture_root, self.workspace, dirs_exist_ok=True)
 
         host_key = self.base / "host_key"
         client_key = self.base / "client_key"
@@ -151,8 +154,6 @@ class LocalSshd:
             }, config_file, indent=2)
             config_file.write("\n")
 
-        (self.workspace / "hello.txt").write_text(
-            "hello from isolated sshd\n", encoding="utf-8")
         return self
 
     @staticmethod

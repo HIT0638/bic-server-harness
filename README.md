@@ -183,6 +183,7 @@ python3 -m compileall -q sshbridge remote.py
 
 - 只监听 `127.0.0.1` 随机高位端口。
 - 以当前用户运行，不需要 `sudo`。
+- 将版本化的 `only4test/` 复制为临时远端工作区初始内容。
 - 使用临时 host key、client key、`authorized_keys`、known_hosts 配置和工作区。
 - 禁用密码认证，只接受临时测试密钥。
 - 测试结束后关闭 sshd、bridge daemon 并删除全部临时文件。
@@ -200,6 +201,9 @@ python3 tests/local_sshd.py
 
 脚本会输出临时 `bridge.local.json` 路径和可直接运行的 `remote.py` 命令。
 按 Ctrl-C 后，环境及临时密钥会被清理。
+
+需要长期保留的本地测试文件放在 `only4test/`。运行时只修改临时副本，不会修改
+Git 中的原始测试文件。
 
 集成测试通过 `SSHBRIDGE_STATE_DIR` 将 daemon PID 和日志放入临时目录。未设置时，
 daemon 状态文件仍位于项目根目录。
