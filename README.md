@@ -148,8 +148,30 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q sshbridge remote.py
 ```
 
-当前测试覆盖路径规范化、SFTP 报文编解码和连接失败分类。在宣布 CLI 行为稳定前，
-应补充 mock 或一次性测试主机的集成测试。
+测试套件会尝试启动隔离的本地 OpenSSH 服务。该服务：
+
+- 只监听 `127.0.0.1` 随机高位端口。
+- 以当前用户运行，不需要 `sudo`。
+- 使用临时 host key、client key、`authorized_keys`、known_hosts 配置和工作区。
+- 禁用密码认证，只接受临时测试密钥。
+- 测试结束后关闭 sshd、bridge daemon 并删除全部临时文件。
+- 不读取或修改系统 SSH 配置、`~/.ssh` 与项目 `bridge.json`。
+
+本地缺少 `ssh`、`sshd` 或 `ssh-keygen` 时，集成测试自动跳过；路径与协议单元测试
+仍会运行。当前集成测试覆盖真实 SFTP 文件流程、并发冲突、符号链接逃逸、大文件限制、
+结构化命令结果、超时、CLI JSON 和 daemon 连接复用。
+
+也可手动启动测试环境：
+
+```sh
+python3 tests/local_sshd.py
+```
+
+脚本会输出临时 `bridge.local.json` 路径和可直接运行的 `remote.py` 命令。
+按 Ctrl-C 后，环境及临时密钥会被清理。
+
+集成测试通过 `SSHBRIDGE_STATE_DIR` 将 daemon PID 和日志放入临时目录。未设置时，
+daemon 状态文件仍位于项目根目录。
 
 ## 状态
 

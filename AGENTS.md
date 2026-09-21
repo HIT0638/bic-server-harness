@@ -68,6 +68,11 @@ python3 -m compileall -q sshbridge remote.py
 操作级测试，覆盖沙箱逃逸、符号链接、原子写入、冲突检查、超时、daemon 路由和
 CLI JSON 输出。
 
+`tests/local_sshd.py` 提供隔离的真实 OpenSSH 测试环境。集成测试必须使用临时密钥、
+随机 localhost 端口、临时工作区和 `SSHBRIDGE_STATE_DIR`，不得访问
+`bridge.json`、`~/.ssh` 或系统 SSH 配置。缺少 OpenSSH 工具时可跳过集成测试；
+OpenSSH 工具存在但行为回归时必须测试失败。
+
 ## 仓库规范
 
 - `bridge.json` 必须保留本地；只跟踪 `bridge.example.json`。

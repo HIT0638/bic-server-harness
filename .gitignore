@@ -15,3 +15,4 @@ bridge.json
 htmlcov/
 .pytest_cache/
 .mypy_cache/
+.test-runtime/

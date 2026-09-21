@@ -34,12 +34,16 @@ def _project_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _state_dir():
+    return os.environ.get("SSHBRIDGE_STATE_DIR") or _project_root()
+
+
 def _pidfile_path():
-    return os.path.join(_project_root(), ".bridge-daemon.json")
+    return os.path.join(_state_dir(), ".bridge-daemon.json")
 
 
 def _log_path():
-    return os.path.join(_project_root(), ".bridge-daemon.log")
+    return os.path.join(_state_dir(), ".bridge-daemon.log")
 
 
 def _log(msg):
