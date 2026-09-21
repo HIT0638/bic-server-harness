@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import hashlib
 import json
 import os
@@ -14,6 +15,14 @@ from sshbridge.broker_client import BrokerClient
 from sshbridge.config import Profile
 from sshbridge.errors import BridgeError
 from sshbridge.sftp_client import SftpSession
+
+try:
+    from mcp import Client, StdioServerParameters
+    MCP_AVAILABLE = True
+except ImportError:
+    Client = None
+    StdioServerParameters = None
+    MCP_AVAILABLE = False
 
 try:
     from tests.local_sshd import LocalSshd, LocalSshdUnavailable
@@ -458,6 +467,228 @@ class TestLocalSshdIntegration(unittest.TestCase):
                 os.environ.pop("SSHBRIDGE_STATE_DIR", None)
             else:
                 os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    @unittest.skipUnless(MCP_AVAILABLE, "MCP Python SDK is not installed")
+    def test_mcp_stdio_workflow_and_shared_broker(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        broker = BrokerClient(str(self.server.config_path), self.profile)
+
+        async def workflow():
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-m", "sshbridge.mcp_server",
+                    "--config", str(self.server.config_path),
+                    "--profile", "local-test",
+                ],
+                env={
+                    "SSHBRIDGE_STATE_DIR": str(self.server.daemon_state),
+                },
+                cwd=str(PROJECT_ROOT),
+            )
+            directory = self.remote_case + "/mcp"
+            text_path = directory + "/note.txt"
+            moved_path = directory + "/moved.txt"
+            binary_path = directory + "/binary.bin"
+
+            async with Client(parameters) as first:
+                tools = await first.list_tools()
+                self.assertEqual(len(tools.tools), 11)
+
+                reconnected = await first.call_tool("reconnect", {})
+                self.assertFalse(reconnected.is_error)
+                self.assertEqual(
+                    reconnected.structured_content["result"][
+                        "tcp_generation"],
+                    1)
+
+                made = await first.call_tool(
+                    "mkdir", {"path": directory})
+                self.assertFalse(made.is_error)
+                written = await first.call_tool(
+                    "write_file",
+                    {"path": text_path, "content": "mcp text\n"})
+                self.assertEqual(
+                    written.structured_content["result"]["bytes_written"],
+                    9)
+
+                listed = await first.call_tool(
+                    "list_dir", {"path": directory})
+                self.assertEqual(
+                    [entry["name"] for entry in
+                     listed.structured_content["result"]["entries"]],
+                    ["note.txt"])
+
+                metadata = await first.call_tool(
+                    "stat", {"path": text_path})
+                self.assertEqual(
+                    metadata.structured_content["result"]["type"], "file")
+                self.assertNotIn(
+                    "real_path", metadata.structured_content["result"])
+
+                read = await first.call_tool(
+                    "read_file", {"path": text_path})
+                self.assertEqual(
+                    read.structured_content["result"]["content"],
+                    "mcp text\n")
+                digest = await first.call_tool(
+                    "hash_file", {"path": text_path})
+                self.assertEqual(
+                    digest.structured_content["result"]["hash"],
+                    hashlib.sha256(b"mcp text\n").hexdigest())
+
+                moved = await first.call_tool(
+                    "move", {"src": text_path, "dst": moved_path})
+                self.assertFalse(moved.is_error)
+
+                (self.local_case / "mcp" / "binary.bin").write_bytes(
+                    b"\x00\xffmcp")
+                binary = await first.call_tool(
+                    "read_file",
+                    {"path": binary_path, "encoding": "base64"})
+                self.assertEqual(
+                    base64.b64decode(
+                        binary.structured_content["result"]["content_b64"]),
+                    b"\x00\xffmcp")
+
+                executed = await first.call_tool(
+                    "exec",
+                    {
+                        "command": "printf mcp-ok",
+                        "cwd": directory,
+                        "timeout": 2,
+                    })
+                self.assertEqual(
+                    executed.structured_content["result"]["stdout"],
+                    "mcp-ok")
+                self.assertNotIn(
+                    "real_cwd", executed.structured_content["result"])
+
+                conflict = await first.call_tool(
+                    "write_file",
+                    {
+                        "path": moved_path,
+                        "content": "bad",
+                        "expected_size": 999,
+                    })
+                self.assertEqual(
+                    self.mcp_error_code(conflict), "CONFLICT")
+                not_empty = await first.call_tool(
+                    "delete", {"path": directory})
+                self.assertEqual(
+                    self.mcp_error_code(not_empty), "NOT_EMPTY")
+
+                status = await first.call_tool(
+                    "connection_status", {})
+                self.assertEqual(
+                    status.structured_content["result"]["tcp_generation"],
+                    1)
+                async with Client(parameters) as second:
+                    second_status = await second.call_tool(
+                        "connection_status", {})
+                    self.assertEqual(
+                        second_status.structured_content["result"][
+                            "tcp_generation"],
+                        1)
+
+                for path in (moved_path, binary_path, directory):
+                    deleted = await first.call_tool(
+                        "delete", {"path": path})
+                    self.assertFalse(deleted.is_error)
+
+        try:
+            asyncio.run(workflow())
+            self.assertTrue(broker.status()["running"])
+            self.assertEqual(broker.status()["tcp_generation"], 1)
+            quiet = subprocess.run(
+                [
+                    sys.executable, "-m", "sshbridge.mcp_server",
+                    "--config", str(self.server.config_path),
+                    "--profile", "local-test",
+                ],
+                cwd=PROJECT_ROOT, env=os.environ.copy(),
+                input="", capture_output=True, text=True, timeout=20)
+            self.assertEqual(quiet.returncode, 0, quiet.stderr)
+            self.assertEqual(quiet.stdout, "")
+            listed = self.run_cli(
+                "--json", "ls", "/", env=os.environ.copy())
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            self.assertEqual(broker.status()["tcp_generation"], 1)
+        finally:
+            broker.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    @unittest.skipUnless(MCP_AVAILABLE, "MCP Python SDK is not installed")
+    def test_mcp_reconnect_recovers_paused_broker(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        broker = BrokerClient(str(self.server.config_path), self.profile)
+
+        async def workflow():
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-m", "sshbridge.mcp_server",
+                    "--config", str(self.server.config_path),
+                    "--profile", "local-test",
+                ],
+                env={
+                    "SSHBRIDGE_STATE_DIR": str(self.server.daemon_state),
+                },
+                cwd=str(PROJECT_ROOT),
+            )
+            async with Client(parameters) as client:
+                listed = await client.call_tool("list_dir", {"path": "/"})
+                self.assertFalse(listed.is_error)
+                self.assertEqual(broker.status()["tcp_generation"], 1)
+
+                subprocess.run(
+                    self.profile.control_argv(
+                        broker.endpoint.control_path, "exit"),
+                    capture_output=True, timeout=5)
+                deadline = time.monotonic() + 2
+                while os.path.exists(broker.endpoint.control_path) \
+                        and time.monotonic() < deadline:
+                    await asyncio.sleep(0.02)
+
+                paused = await client.call_tool(
+                    "list_dir", {"path": "/"})
+                self.assertEqual(
+                    self.mcp_error_code(paused), "CONNECTION_PAUSED")
+                await asyncio.sleep(0.06)
+                reconnected = await client.call_tool("reconnect", {})
+                self.assertFalse(reconnected.is_error)
+                self.assertEqual(
+                    reconnected.structured_content["result"][
+                        "tcp_generation"],
+                    2)
+                recovered = await client.call_tool(
+                    "list_dir", {"path": "/"})
+                self.assertFalse(recovered.is_error)
+
+        try:
+            asyncio.run(workflow())
+        finally:
+            broker.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    @staticmethod
+    def mcp_error_code(result):
+        text = "\n".join(
+            item.text for item in result.content
+            if getattr(item, "type", None) == "text")
+        start = text.find("{")
+        if start < 0:
+            raise AssertionError(
+                "MCP error did not contain JSON: %r" % text)
+        return json.loads(text[start:])["error"]["code"]
 
     def run_cli(self, *arguments, env=None):
         return subprocess.run(
