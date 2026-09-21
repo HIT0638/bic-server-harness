@@ -1,0 +1,14 @@
+{
+  "default_profile": "fake",
+  "daemon_port": 7799,
+  "profiles": {
+    "fake": {
+      "host": "127.0.0.1",
+      "port": 1,
+      "user": "nobody",
+      "root": "/tmp/sandbox",
+      "connect_timeout": 2,
+      "op_timeout": 10
+    }
+  }
+}

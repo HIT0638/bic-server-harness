@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Local bridge state and configuration
+bridge.json
+.bridge-daemon.json
+.bridge-daemon.log
+
+# Test and tool output
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/

@@ -1,0 +1,20 @@
+{
+  "default_profile": "legacy-linux",
+  "daemon_port": 7766,
+  "profiles": {
+    "legacy-linux": {
+      "host": "legacy-host",
+      "port": 22,
+      "user": "remote-user",
+      "root": "/home/remote-user/project",
+      "batch_mode": true,
+      "strict_host_key": "yes",
+      "ssh_args": [
+        "-o",
+        "ServerAliveInterval=60",
+        "-o",
+        "ServerAliveCountMax=5"
+      ]
+    }
+  }
+}
