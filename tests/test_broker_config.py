@@ -34,6 +34,8 @@ class TestConnectionPolicy(unittest.TestCase):
         self.assertEqual(profile.connection_policy["exec_concurrency"], 2)
         self.assertEqual(profile.connection_policy["connect_retries"], 0)
         self.assertTrue(profile.connection_policy["control_master"])
+        self.assertEqual(profile.rsync_bin, "rsync")
+        self.assertEqual(profile.remote_rsync_bin, "rsync")
 
     def test_valid_direct_policy(self):
         profile = Profile("test", profile_raw(connection_policy={
@@ -69,6 +71,31 @@ class TestConnectionPolicy(unittest.TestCase):
                     Profile(
                         "test",
                         profile_raw(connection_policy=policy))
+                self.assertEqual(caught.exception.code, "INVALID_CONFIG")
+
+    def test_rsync_executable_configuration(self):
+        profile = Profile("test", profile_raw(
+            rsync_bin="/opt/homebrew/bin/rsync",
+            remote_rsync_bin="/usr/local/bin/rsync"))
+        self.assertEqual(profile.rsync_bin, "/opt/homebrew/bin/rsync")
+        self.assertEqual(
+            profile.remote_rsync_bin, "/usr/local/bin/rsync")
+
+    def test_invalid_rsync_executable_values(self):
+        cases = [
+            {"rsync_bin": ""},
+            {"rsync_bin": 3},
+            {"remote_rsync_bin": ""},
+            {"remote_rsync_bin": "rsync --server"},
+            {"remote_rsync_bin": "../rsync"},
+            {"remote_rsync_bin": "/opt/../bin/rsync"},
+            {"remote_rsync_bin": "/opt/bin/rsync;touch"},
+            {"remote_rsync_bin": "/opt/bin/rsync dir"},
+        ]
+        for values in cases:
+            with self.subTest(values=values):
+                with self.assertRaises(BridgeError) as caught:
+                    Profile("test", profile_raw(**values))
                 self.assertEqual(caught.exception.code, "INVALID_CONFIG")
 
     def test_multiplex_options_precede_host(self):

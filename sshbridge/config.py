@@ -2,6 +2,8 @@
 
 import json
 import os
+import posixpath
+import re
 import sys
 
 from .errors import BridgeError
@@ -19,6 +21,8 @@ DEFAULTS = {
     "strict_host_key": "accept-new",
     "allow_controlmaster": False,         # only relevant on Windows (see ssh_argv)
     "ssh_args": [],                       # extra ssh options, e.g. ["-i", "key", "-J", "jump"]
+    "rsync_bin": "rsync",                 # optional local rsync executable
+    "remote_rsync_bin": "rsync",          # optional remote rsync executable
 }
 
 CONNECTION_POLICY_DEFAULTS = {
@@ -34,6 +38,8 @@ CONNECTION_POLICY_DEFAULTS = {
 
 _VALID_STRICT = ("yes", "no", "accept-new", "off")
 _VALID_CONNECTION_MODES = ("broker", "direct")
+_REMOTE_EXECUTABLE = re.compile(
+    r"(?:[A-Za-z0-9._+-]+|/(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+)\Z")
 
 DEFAULT_PORT = 7766  # local daemon port (configurable via "daemon_port")
 
@@ -98,10 +104,29 @@ class Profile:
                               % (name, _VALID_STRICT))
         if not isinstance(opts["ssh_args"], list):
             raise BridgeError("INVALID_CONFIG", "profile %s: ssh_args must be a list" % name)
+        self._validate_rsync_executables(opts)
         self.connection_policy = self._connection_policy(
             raw.get("connection_policy"))
         self.control_path = None
         self.__dict__.update(opts)
+
+    def _validate_rsync_executables(self, opts):
+        local = opts["rsync_bin"]
+        if not isinstance(local, str) or not local \
+                or local.strip() != local or "\x00" in local \
+                or (os.sep in local and not os.path.isabs(local)):
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: rsync_bin must be an executable name "
+                "or absolute path" % self.name)
+        remote = opts["remote_rsync_bin"]
+        if not isinstance(remote, str) or not remote \
+                or not _REMOTE_EXECUTABLE.fullmatch(remote) \
+                or posixpath.normpath(remote) != remote:
+            raise BridgeError(
+                "INVALID_CONFIG",
+                "profile %s: remote_rsync_bin must be a safe executable "
+                "name or absolute POSIX path" % self.name)
 
     def _connection_policy(self, raw):
         if raw is None:
