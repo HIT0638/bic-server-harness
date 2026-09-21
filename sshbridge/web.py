@@ -78,10 +78,10 @@ class ExplorerHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, profile, token):
-        super().__init__(address, ExplorerHandler)
         self.profile = profile
         self.token = token
         self.workspace = WorkspaceService(profile)
+        super().__init__(address, ExplorerHandler)
 
     def server_close(self):
         self.workspace.close()

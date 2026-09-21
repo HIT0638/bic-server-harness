@@ -1,4 +1,6 @@
+import errno
 import json
+import socket
 import threading
 import unittest
 from urllib.error import HTTPError
@@ -16,8 +18,9 @@ class TestWebExplorerIntegration(unittest.TestCase):
         cls.sshd = LocalSshd()
         try:
             cls.sshd.start()
-            profile = Profile("web-test", cls.sshd.profile_raw)
-            cls.web = create_server(profile, port=0, token="test-token")
+            cls.profile = Profile("web-test", cls.sshd.profile_raw)
+            cls.web = create_server(
+                cls.profile, port=0, token="test-token")
             cls.thread = threading.Thread(
                 target=cls.web.serve_forever, daemon=True)
             cls.thread.start()
@@ -75,6 +78,15 @@ class TestWebExplorerIntegration(unittest.TestCase):
         self.assertEqual(payload["profile"], "web-test")
         self.assertEqual(payload["workspace_root"], "/")
         self.assertNotIn("root", payload)
+
+    def test_occupied_port_preserves_bind_error(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            with self.assertRaises(OSError) as caught:
+                create_server(self.profile, port=port, token="test-token")
+        self.assertEqual(caught.exception.errno, errno.EADDRINUSE)
 
     def test_remote_file_workflow(self):
         base = "/web-flow"
