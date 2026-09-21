@@ -1,5 +1,10 @@
 # Rsync 批量传输
 
+## 状态
+
+当前未实现。CLI/Broker MVP 方案已收敛，详细实施步骤见
+`.trae/documents/rsync-batch-transfer-mvp-implementation-plan.md`。
+
 ## 背景
 
 SFTP 适合目录浏览、小文件读写和编辑器保存。大文件或大量文件通过逐个 SFTP 请求传输
@@ -36,7 +41,7 @@ session，操作由 `sftp_lock` 串行化。当前没有批量同步 API、能�
 - 不占用 SFTP 操作锁。
 - 复用 broker 的 OpenSSH ControlMaster，不新增 TCP 握手。
 - 所有源和目标仍受 remote root 约束。
-- 远端无 rsync 时自动回退到 SFTP 或返回明确能力错误。
+- 本地或远端无兼容 Rsync 时返回明确能力错误，基础 SFTP 功能不受影响。
 
 ## 预期
 
@@ -50,44 +55,51 @@ session，操作由 `sftp_lock` 串行化。当前没有批量同步 API、能�
 
 ### 能力发现
 
-- broker 建立连接后低频执行一次 `command -v rsync`。
-- 缓存远端 rsync 版本和可用参数。
+- 首次同步前探测本地与远端 Rsync，Broker 生命周期内缓存结果。
+- 本地与远端都必须支持 `--protect-args`，不能只依赖版本字符串判断。
+- 当前 transport 必须存在可用 ControlMaster；降级 transport 不启动 Rsync。
 - 能力探测失败不影响基础 SFTP 功能。
 
 ### API
 
-候选操作：
+Broker 操作：
 
 ```text
-sync_push(local_paths, remote_dir, options)
-sync_pull(remote_paths, local_dir, options)
+sync_start(direction, sources, destination)
 sync_status(job_id)
 sync_cancel(job_id)
 ```
 
-- 默认批量任务异步执行并返回 job ID。
-- 默认只允许工作区内的远端路径。
-- 本地路径需由调用方明确授权；MCP schema 不接受任意隐式目录。
+- `sync_start` 异步返回 job ID。
+- push 支持一个或多个显式本地源，目标为已存在远端目录。
+- pull 首版支持一个远端文件或目录，目标为已存在本地目录。
+- CLI 是首版唯一入口；Web、Desktop 和 MCP 不在本期范围。
 
 ### 传输
 
 - 使用系统 `rsync`。
-- 通过 broker 提供的 ControlPath 调用系统 `ssh`。
-- Rsync 并发默认 1。
-- 支持 `--partial` 和可兼容的增量参数。
-- 参数以 argv 传递，不拼接 shell 字符串。
-- 旧版 rsync 不支持的选项通过能力检测关闭。
+- 通过 Broker 提供的 ControlPath 调用系统 `ssh`，不可复用时失败。
+- Rsync 并发固定为 1，等待队列最多 8 个任务。
+- 使用 `--partial-dir=.sshbridge-partial` 保留失败或取消后的 partial。
+- 使用 `--links --safe-links`，不跟随传输树外部的符号链接。
+- 不接受任意 Rsync options，不支持 destructive `--delete`。
+- `-e` remote-shell 字符串只由受信任 profile 和 ControlPath 构造；用户路径仅作为
+  `--` 后的独立 operand。
+- 远端源和目标在启动任务前经 SFTP `REALPATH` 与 canonical root 校验。
 
 ### 回退
 
-- 远端无 rsync 时，小文件批量可退化为顺序 SFTP。
-- 大文件是否自动退化由策略控制，避免长时间占用交互 SFTP。
-- 返回结果明确标记 `transport=rsync` 或 `transport=sftp`。
+- MVP 不自动回退 SFTP，结果固定标记 `transport=rsync`。
+- 缺少 executable、`--protect-args` 或 ControlMaster 时返回稳定能力错误。
+- 显式 SFTP fallback 作为后续独立设计，避免静默阻塞交互 SFTP channel。
 
 ## 验收标准
 
 - Rsync 任务运行时 `list_dir` 延迟不受 SFTP 锁阻塞。
 - 传输使用现有 ControlMaster，不增加 SSH TCP。
-- 所有远端目标通过 canonical root 校验。
+- 所有远端源和目标通过 canonical root 校验。
+- 路径和 executable 参数无法通过 shell metacharacter 注入。
+- push、pull、status 和 cancel 返回稳定 JSON-ready 结果。
+- 单并发、队列、输出缓存和任务历史均有固定上限。
 - 无 rsync 的测试主机仍可使用全部基础文件操作。
-- 中断和恢复测试不会产生静默成功或未报告的部分结果。
+- 取消不得错误宣称远端进程已确认终止。
