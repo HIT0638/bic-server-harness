@@ -5,8 +5,8 @@
 `.github/workflows/windows-tests.yml` 在 GitHub 托管的 Windows Server 2022、2025 x64
 环境运行 Python 3.12 测试。无需本地 Windows 机器，也无需提供远端主机或 SSH 密钥。
 
-这是一套适配基线，不代表 Windows MCP 正式版已经可用。当前 Broker 仍拒绝 Windows；
-named pipe、用户 ACL、单例锁及真实 Windows MCP Host 联调尚未实现或验证。
+这是一套适配基线，不代表 Windows MCP 正式版已经完成验收。基线包含原生 Windows
+Broker；真实 Windows 桌面 MCP Host 安装及 Windows 到远端 Linux 联调仍需验证。
 
 工作流检查：
 
@@ -14,6 +14,10 @@ named pipe、用户 ACL、单例锁及真实 Windows MCP Host 联调尚未实现
 - 路径安全、SFTP 报文和 OpenSSH 参数构造的现有单元测试。
 - 原生 Python 子进程的输出、退出码、取消、超时，以及含空格和中文的本地工作目录。
 - 真实 MCP SDK 与 mock Broker 的 schema、annotations、参数映射、错误和结果上限。
+- named pipe 当前用户 ACL、匿名访问拒绝、junction 拒绝、实例抢占保护和 I/O 超时。
+- 真实前台 Broker 并发启动、profile 隔离、身份验证、熔断与显式重连。
+- 真实 MCP stdio 子进程共享预启动 Broker、错误脱敏与退出后的 Broker 存续。
+- Host 禁止独立子进程时，自动启动明确失败，不产生退出时被 Host 连带终止的 Broker。
 - Python 编译检查。
 
 SDK 导入失败、任何测试失败或跳过均使工作流失败，不把可选依赖缺失当作成功。
@@ -46,14 +50,20 @@ py -3.12 -m venv .venv/windows-ci
 ```
 
 Mac/Linux 可省略 `--require-windows` 检查同一套基础测试，但结果不能作为 Windows 验收。
-现有全量测试含 `fcntl`、`/bin/sh` 和隔离 POSIX sshd，不能直接在 Windows 全量发现。
+现有全量测试含 POSIX 专用断言、`/bin/sh` 和隔离 POSIX sshd，不能直接在 Windows 全量发现。
 Windows 当前只运行脚本明确列出的测试，未选入的测试不是已通过，也不是静默跳过。
+
+GitHub Windows runner 本身也使用禁止 breakaway 的 Job Object。测试明确运行独立的
+`python -m sshbridge.broker --serve` 进程，仍受 CI 生命周期约束；MCP 子进程连接这个
+已运行的 Broker。测试不修改 runner 或 Host 的 Job Object，不绕过其退出清理策略。
+自动后台启动成功的路径仍需在允许独立进程的实际用户环境验收；受限环境中的明确拒绝
+已纳入自动测试。
 
 ## 后续验收
 
-1. Windows Broker 实现后，加入 named pipe 访问控制、启动竞态和多客户端复用测试。
-2. 准备隔离 Linux SSH 目标，增加 Windows 到 Linux 的 SFTP、Exec 与断线恢复测试。
-3. 加入真实 MCP stdio 子进程与 Broker 联调；现有 mock 测试不覆盖该链路。
-4. 发布前在目标 Windows 10/11 与实际 MCP Host 验证安装和启动。
+1. 准备隔离 Linux SSH 目标，增加 Windows 到 Linux 的 SFTP、Exec 与断线恢复测试。
+2. 扩展 stdio 集成测试，覆盖真实远端文件读写和命令结果；当前原生 Windows 测试使用
+   缺失的 SSH executable 验证失败链路，不会连接任何远端或读取用户 SSH 配置。
+3. 发布前在目标 Windows 10/11 与实际 MCP Host 验证安装和启动。
 
 不能以修改平台标识或 mock Windows API 代替以上真实平台验证。

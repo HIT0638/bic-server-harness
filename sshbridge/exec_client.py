@@ -1,6 +1,7 @@
 """Remote command execution via the system ssh binary (structured output)."""
 
 import shlex
+import os
 import subprocess
 import time
 
@@ -62,6 +63,7 @@ def start_exec(profile, command, cwd):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
         )
     except FileNotFoundError:
         raise BridgeError(
@@ -79,7 +81,9 @@ def run_exec(profile, command, cwd, timeout, connect_retries=2, retry_delay=3.0)
     attempts = connect_retries + 1
     for attempt in range(attempts):
         try:
-            cp = subprocess.run(argv, capture_output=True, timeout=timeout)
+            cp = subprocess.run(
+                argv, capture_output=True, timeout=timeout,
+                **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
         except subprocess.TimeoutExpired as e:
             return {
                 "exit_code": None,

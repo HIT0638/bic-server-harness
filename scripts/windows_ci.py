@@ -40,13 +40,17 @@ def main(argv=None):
         "ssh_executable": shutil.which("ssh"),
         "suite": list(TEST_MODULES),
         "not_verified": [
-            "Native Windows Broker (named pipe, ACL, singleton, shared clients)",
             "OpenSSH ControlMaster runtime support and connection reuse",
-            "Windows MCP Host over stdio with a real Broker",
+            "Automatic background Broker launch outside restrictive Windows Job Objects",
+            "Interactive Windows 10/11 MCP Host installation and launch",
             "Windows-to-Linux SFTP, remote exec and reconnect",
             "Rsync and desktop packaging",
         ],
     }
+    if os.name == "nt":
+        report["suite"].append("tests.test_windows_broker")
+    else:
+        report["not_verified"].append("Native Windows IPC and MCP/Broker integration (not run on this platform)")
     errors = []
     if args.require_windows and os.name != "nt":
         errors.append("This CI job requires native Windows.")
@@ -76,7 +80,7 @@ def main(argv=None):
 
     if not errors:
         with (output / "tests.log").open("w", encoding="utf-8") as log:
-            suite = unittest.defaultTestLoader.loadTestsFromNames(TEST_MODULES)
+            suite = unittest.defaultTestLoader.loadTestsFromNames(report["suite"])
             result = unittest.TextTestRunner(stream=log, verbosity=2).run(suite)
         report["tests"] = {
             "run": result.testsRun, "failures": len(result.failures),
@@ -98,7 +102,8 @@ def main(argv=None):
         "Result: **%s**" % ("PASS" if not errors else "FAIL"),
         "", "Platform: %s; Python %s." % (report["platform"], report["python"]),
         "", "This is a compatibility baseline, **not Windows product readiness**.",
-        "MCP tests use the real SDK with a fake Broker; process tests use local Python children.",
+        "Tests cover SDK contracts and native process jobs; native Windows also runs named pipe and MCP stdio/Broker tests.",
+        "Remote SSH operations are not verified by this baseline.",
         "No user SSH configuration, real profile, remote host or credentials are used.",
         "", "## Not yet verified", "",
     ]

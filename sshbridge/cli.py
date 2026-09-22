@@ -347,6 +347,8 @@ def _broker_mgmt(args, client):
 
 
 def _broker_sync(args, client):
+    if sys.platform == "win32":
+        raise BridgeError("BROKER_UNSUPPORTED", "Rsync requires OpenSSH ControlMaster and is unavailable on Windows")
     status = client.ensure_started()
     if "rsync" not in status.get("features", []):
         raise BridgeError(

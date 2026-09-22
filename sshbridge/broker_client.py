@@ -20,7 +20,7 @@ _UNIX_PATH_LIMIT = 103
 
 def profile_fingerprint(config_path, profile):
     values = [
-        os.path.abspath(config_path),
+        os.path.normcase(os.path.abspath(config_path)),
         profile.name,
         profile.host,
         int(profile.port),
@@ -34,6 +34,9 @@ def profile_fingerprint(config_path, profile):
 
 def runtime_dir():
     configured = os.environ.get("SSHBRIDGE_STATE_DIR")
+    if os.name == "nt":
+        from .windows_ipc import private_runtime_dir
+        return private_runtime_dir(configured)
     if configured:
         path = os.path.abspath(os.path.expanduser(configured))
     else:
@@ -104,14 +107,17 @@ class BrokerEndpoint:
         prefix = "b-" + self.fingerprint
         endpoint_dir = self.runtime_dir
         candidate = os.path.join(endpoint_dir, endpoint_id + ".c")
-        if len(candidate.encode("utf-8")) > 80:
+        if os.name != "nt" and len(candidate.encode("utf-8")) > 80:
             endpoint_dir = _short_runtime_alias(self.runtime_dir)
         self.socket_path = os.path.join(endpoint_dir, endpoint_id + ".s")
         self.metadata_path = os.path.join(self.runtime_dir, prefix + ".json")
         self.lock_path = os.path.join(self.runtime_dir, prefix + ".lock")
         self.control_path = os.path.join(endpoint_dir, endpoint_id + ".c")
         self.log_path = os.path.join(endpoint_dir, prefix + ".log")
-        if len(self.socket_path.encode("utf-8")) > _UNIX_PATH_LIMIT:
+        if os.name == "nt":
+            from .windows_ipc import pipe_name
+            self.socket_path = pipe_name(self.runtime_dir, self.fingerprint)
+        elif len(self.socket_path.encode("utf-8")) > _UNIX_PATH_LIMIT:
             raise BridgeError(
                 "BROKER_UNAVAILABLE",
                 "broker socket path is too long: %s" % self.socket_path)
@@ -128,13 +134,18 @@ class BrokerEndpoint:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         descriptor = None
         try:
-            descriptor = os.open(temporary, flags, 0o600)
+            if os.name == "nt":
+                from .windows_ipc import private_file_descriptor
+                descriptor = private_file_descriptor(temporary, exclusive=True)
+            else:
+                descriptor = os.open(temporary, flags, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 descriptor = None
                 json.dump(metadata, stream, ensure_ascii=False)
                 stream.write("\n")
             os.replace(temporary, self.metadata_path)
-            os.chmod(self.metadata_path, 0o600)
+            if os.name != "nt":
+                os.chmod(self.metadata_path, 0o600)
         except OSError as error:
             if descriptor is not None:
                 os.close(descriptor)
@@ -153,7 +164,10 @@ class BrokerEndpoint:
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 raise BridgeError(
                     "BROKER_UNAVAILABLE", "broker metadata is not a regular file")
-            if info.st_uid != os.getuid() \
+            if os.name == "nt":
+                from .windows_ipc import check_private_path
+                check_private_path(self.metadata_path)
+            elif info.st_uid != os.getuid() \
                     or stat.S_IMODE(info.st_mode) & 0o077:
                 raise BridgeError(
                     "BROKER_UNAVAILABLE",
@@ -166,6 +180,10 @@ class BrokerEndpoint:
             raise BridgeError(
                 "BROKER_UNAVAILABLE",
                 "cannot read broker metadata: %s" % error)
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("pid"), int) \
+                or isinstance(metadata["pid"], bool) or metadata["pid"] <= 0 \
+                or not isinstance(metadata.get("instance_id"), str) or not metadata["instance_id"]:
+            raise BridgeError("BROKER_UNAVAILABLE", "invalid broker metadata identity")
         if metadata.get("protocol_version") != PROTOCOL_VERSION:
             raise BridgeError(
                 "BROKER_UNAVAILABLE", "unsupported broker protocol version")
@@ -182,10 +200,6 @@ class BrokerEndpoint:
 
 class BrokerClient:
     def __init__(self, config_path, profile):
-        if os.name == "nt":
-            raise BridgeError(
-                "BROKER_UNSUPPORTED",
-                "broker mode requires a Unix socket; use direct mode on Windows")
         self.config_path = os.path.abspath(config_path)
         self.profile = profile
         self.endpoint = BrokerEndpoint(self.config_path, profile)
@@ -204,19 +218,27 @@ class BrokerClient:
                               separators=(",", ":")) + "\n").encode("utf-8")
         if len(encoded) > MAX_MESSAGE:
             raise BridgeError("INVALID_ARG", "broker request is too large")
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection = None
         try:
-            connection.settimeout(min(2.0, timeout))
-            connection.connect(self.endpoint.socket_path)
+            if os.name == "nt":
+                from .windows_ipc import connect
+                connection = connect(self.endpoint.socket_path, min(2.0, timeout), metadata["pid"])
+            else:
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.settimeout(min(2.0, timeout))
+                connection.connect(self.endpoint.socket_path)
             connection.settimeout(timeout)
             connection.sendall(encoded)
             raw = _read_message(connection)
+            if os.name == "nt":
+                connection.sendall(b"\x00")  # response consumed before server closes pipe
         except (FileNotFoundError, ConnectionRefusedError, socket.timeout,
                 OSError) as error:
             raise BridgeError(
                 "BROKER_UNAVAILABLE", "cannot reach broker: %s" % error)
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
         try:
             response = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as error:
@@ -265,12 +287,21 @@ class BrokerClient:
         kwargs = {}
         if os.name != "nt":
             kwargs["start_new_session"] = True
+        else:
+            from .windows_ipc import broker_creation_flags
+            kwargs["creationflags"] = broker_creation_flags()
         try:
             process = subprocess.Popen(
                 argv, cwd=root, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 **kwargs)
         except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 5:
+                raise BridgeError(
+                    "BROKER_UNAVAILABLE",
+                    "Windows refused an independent Broker process; start the profile "
+                    "with 'remote.py broker start' in a separate terminal before opening "
+                    "the MCP Host (a restrictive Windows Job Object may prevent auto-start)")
             raise BridgeError(
                 "BROKER_UNAVAILABLE", "cannot start broker: %s" % error)
         deadline = time.monotonic() + timeout
@@ -318,11 +349,12 @@ class BrokerClient:
                 raise
             return {"stopped": False, "note": "not running"}
         deadline = time.monotonic() + 5
+        sentinel = self.endpoint.metadata_path if os.name == "nt" else self.endpoint.socket_path
         while time.monotonic() < deadline:
-            if not os.path.exists(self.endpoint.socket_path):
+            if not os.path.exists(sentinel):
                 break
             time.sleep(0.05)
-        stopped = not os.path.exists(self.endpoint.socket_path)
+        stopped = not os.path.exists(sentinel)
         result["stopped"] = stopped
         if not stopped:
             result["note"] = "broker shutdown is still in progress"

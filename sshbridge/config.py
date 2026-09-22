@@ -26,7 +26,7 @@ DEFAULTS = {
 }
 
 CONNECTION_POLICY_DEFAULTS = {
-    "mode": "direct" if sys.platform == "win32" else "broker",
+    "mode": "broker",
     "exec_concurrency": 2,
     "exec_queue_limit": 8,
     "exec_queue_timeout": 60,

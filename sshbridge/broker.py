@@ -1,9 +1,8 @@
-"""Per-profile Unix-socket connection broker."""
+"""Per-profile local connection broker (Unix sockets or Windows named pipes)."""
 
 import argparse
 import base64
 import errno
-import fcntl
 import json
 import os
 import signal
@@ -14,6 +13,11 @@ import sys
 import threading
 import time
 import uuid
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from . import ops
 from .broker_client import (MAX_MESSAGE, PROTOCOL_VERSION, BrokerEndpoint,
@@ -96,7 +100,7 @@ class BrokerState:
                     if self.transport.multiplexing else "openssh-direct"),
                 "multiplexing": self.transport.multiplexing,
                 "degraded_reason": self.transport.degraded_reason,
-                "features": ["sftp", "exec", "rsync"],
+                "features": ["sftp", "exec"] + ([] if os.name == "nt" else ["rsync"]),
                 "capabilities": ["exec_jobs_v1"],
             }
         result.update(exec_snapshot)
@@ -443,13 +447,14 @@ class BrokerServer:
         self.shutdown_event = threading.Event()
         self.listener = None
         self.lock_file = None
+        self._owns_endpoint = False
 
     def serve_forever(self):
         self._acquire_singleton()
-        self._bind()
-        self.endpoint.write_metadata(os.getpid(), self.instance_id)
-        self._install_signals()
         try:
+            self._bind()
+            self.endpoint.write_metadata(os.getpid(), self.instance_id)
+            self._install_signals()
             while not self.shutdown_event.is_set():
                 try:
                     connection, _ = self.listener.accept()
@@ -472,25 +477,44 @@ class BrokerServer:
                 pass
             self.listener = None
         self.state.close()
-        for path in (self.endpoint.metadata_path, self.endpoint.socket_path):
+        paths = [self.endpoint.metadata_path]
+        if os.name != "nt":
+            paths.append(self.endpoint.socket_path)
+        for path in paths if self._owns_endpoint else ():
             try:
                 os.remove(path)
             except FileNotFoundError:
                 pass
         if self.lock_file is not None:
             try:
-                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+                if os.name == "nt":
+                    self.lock_file.seek(0)
+                    msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
                 self.lock_file.close()
             except OSError:
                 pass
             self.lock_file = None
+        self._owns_endpoint = False
 
     def _acquire_singleton(self):
         try:
-            self.lock_file = open(self.endpoint.lock_path, "a+b")
-            os.chmod(self.endpoint.lock_path, 0o600)
-            fcntl.flock(
-                self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.name == "nt":
+                from .windows_ipc import private_file_descriptor
+                self.lock_file = os.fdopen(private_file_descriptor(self.endpoint.lock_path), "r+b")
+                self.lock_file.seek(0, os.SEEK_END)
+                if self.lock_file.tell() == 0:
+                    self.lock_file.write(b"\0")
+                    self.lock_file.flush()
+                self.lock_file.seek(0)
+                msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                self.lock_file = open(self.endpoint.lock_path, "a+b")
+                os.chmod(self.endpoint.lock_path, 0o600)
+                fcntl.flock(
+                    self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._owns_endpoint = True
         except OSError as error:
             if self.lock_file is not None:
                 self.lock_file.close()
@@ -504,6 +528,13 @@ class BrokerServer:
                 "cannot acquire broker lock: %s" % error)
 
     def _bind(self):
+        if os.name == "nt":
+            from .windows_ipc import PipeListener
+            try:
+                self.listener = PipeListener(self.endpoint.socket_path)
+            except OSError as error:
+                raise BridgeError("BROKER_UNAVAILABLE", "cannot bind broker pipe: %s" % error)
+            return
         self._remove_stale_socket()
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -585,6 +616,9 @@ class BrokerServer:
             connection.close()
 
     def _check_peer_uid(self, connection):
+        if os.name == "nt":
+            connection.verify_peer()
+            return
         peer_uid = None
         if hasattr(connection, "getpeereid"):
             peer_uid = connection.getpeereid()[0]
@@ -614,6 +648,9 @@ class BrokerServer:
                            separators=(",", ":")) + "\n").encode("utf-8")
             if len(encoded) <= MAX_MESSAGE:
                 connection.sendall(encoded)
+                if os.name == "nt":
+                    connection.settimeout(2)
+                    connection.recv(1)  # wait for response consumption, never unbounded flush
         except OSError:
             pass
 
@@ -642,7 +679,7 @@ def main(argv=None):
     arguments = parser.parse_args(argv)
     if not arguments.serve:
         parser.error("--serve is required")
-    if arguments.detach:
+    if arguments.detach and os.name != "nt":
         child = os.fork()
         if child:
             return 0
