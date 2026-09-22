@@ -384,6 +384,9 @@ config alias。raw IPv6 应先配置 SSH alias。
 
 ## 测试
 
+Windows 云端适配基线与本机复现步骤见 [Windows 自动测试](docs/windows-testing.md)。
+该基线不代表 Windows Broker 或完整 MCP 工作流已经可用。
+
 ```sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q sshbridge remote.py
