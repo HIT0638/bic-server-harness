@@ -6,6 +6,7 @@ to the ssh binary; this module only speaks the SFTP protocol itself.
 """
 
 import struct
+import os
 import subprocess
 import threading
 import time
@@ -80,7 +81,8 @@ class SftpSession:
         try:
             self.proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE)
+                stderr=subprocess.PIPE,
+                **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
         except FileNotFoundError:
             raise BridgeError("SSH_ERROR", "ssh binary not found: %r" % argv[0])
         threading.Thread(target=self._drain_stderr, daemon=True).start()

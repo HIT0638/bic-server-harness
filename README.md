@@ -100,10 +100,11 @@ cp bridge.example.json bridge.json
 Desktop 保持可用。同步前会检查 `--protect-args` 或其现代名称
 `--secluded-args`，但实际传输参数固定使用兼容别名 `--protect-args`。
 
-macOS 和 Linux 默认使用 `broker` 模式。`direct` 模式仅用于诊断和兼容；它不会
-提供跨进程连接复用或全局熔断保护。Windows 当前默认使用 `direct`，本期尚未实现
-具备当前用户 ACL 的 named pipe，因此显式选择 `broker` 会返回
-`BROKER_UNSUPPORTED`。
+macOS、Linux 和 Windows 默认使用 `broker` 模式。`direct` 模式仅用于诊断和兼容；它不会
+提供跨进程连接复用或全局熔断保护。Windows 使用带当前用户 SID ACL 的本地 named pipe。Windows 上保留显式
+`direct` 诊断模式，但 MCP 仍只允许 Broker。Windows 不启用 ControlMaster，SFTP
+保持一个顺序长连接，Exec 单并发且每次启动独立 SSH 连接，受连接频率限制。
+Windows 暂不提供 Rsync；这不影响文件操作与命令执行。
 
 ## CLI 使用
 
@@ -249,7 +250,8 @@ python3 remote.py --profile local-test serve
 
 ## Connection Broker
 
-Broker 按 profile 自动启动，只监听当前用户可访问的 Unix socket。启动本地 Broker
+Broker 按 profile 自动启动：macOS/Linux 使用私有 Unix socket，Windows 使用
+仅当前用户可访问并拒绝远程客户端的 named pipe。启动本地 Broker
 不会立即连接远端；首个文件或命令请求才会建立 SSH。
 
 ```sh
@@ -263,7 +265,7 @@ python3 remote.py --config bridge.json broker stop
 首次失败后状态进入 `OPEN`，后续业务请求立即返回 `CONNECTION_PAUSED`；只有
 `broker reconnect` 会执行一次受频率限制的重连。
 
-Broker 的运行目录权限为 `0700`，socket 和 metadata 权限为 `0600`。请求携带协议
+macOS/Linux Broker 的运行目录权限为 `0700`，socket 和 metadata 权限为 `0600`。请求携带协议
 版本、request ID 和 profile fingerprint；支持 peer credential 的系统还会校验
 客户端 UID。`daemon start|status|reconnect|stop` 暂时保留为弃用别名，不再监听
 localhost TCP。
@@ -284,6 +286,38 @@ READY 状态或影响后续基础操作。
 `exec_output_limit_bytes`、`exec_job_ttl` 和 `exec_max_jobs` 配置。
 job 只保存在当前 Broker 内存中，Broker 重启后旧 job ID 返回
 `EXEC_JOB_NOT_FOUND`。
+
+## Windows MCP
+
+在仓库根目录的 PowerShell 中创建 Python 3.12 环境：
+
+```powershell
+py -3.12 -m venv .venv/mcp
+.venv/mcp/Scripts/python.exe -m pip install -r requirements-mcp.txt
+.venv/mcp/Scripts/python.exe -m sshbridge.mcp_server --config "$PWD/bridge.json"
+```
+
+MCP Host 中使用 Python、配置和仓库的绝对路径。例如：
+
+```json
+{
+  "mcpServers": {
+    "sshbridge": {
+      "command": "C:/projects/BIC-Server-Harness/.venv/mcp/Scripts/python.exe",
+      "args": ["-m", "sshbridge.mcp_server", "--config", "C:/projects/BIC-Server-Harness/bridge.json"],
+      "env": {"PYTHONPATH": "C:/projects/BIC-Server-Harness"}
+    }
+  }
+}
+```
+
+Broker 默认状态目录为 `%LOCALAPPDATA%/SSHBridge/run`，可由 `SSHBRIDGE_STATE_DIR`
+覆盖。新目录和文件在创建时设置当前用户 ACL；已有目录权限过宽或使用 junction / 符号链接
+时拒绝启动，不自动改写权限。多个客户端复用同一 profile 的 Broker，MCP 退出不停止它。
+
+Windows 不承诺 SSH TCP 复用或 Rsync 支持。当前云端测试覆盖本地 named pipe、用户权限、
+并发启动、MCP stdio 与真实 Broker 的状态和错误链路；Windows 到远端 Linux 的完整
+文件／命令流程及实际桌面 MCP Host 安装仍需独立验收。
 
 ## MCP Server
 
@@ -361,7 +395,8 @@ config alias。raw IPv6 应先配置 SSH alias。
 ## 架构
 
 - `sshbridge/cli.py`：参数解析、结果渲染、Broker 路由。
-- `sshbridge/broker_client.py`：Unix socket endpoint、自动启动与客户端协议。
+- `sshbridge/broker_client.py`：平台 endpoint、自动启动与客户端协议。
+- `sshbridge/windows_ipc.py`：Windows named pipe、用户 ACL、进程身份与有界 I/O。
 - `sshbridge/broker.py`：连接状态机、SFTP/Exec 队列和请求分发。
 - `sshbridge/transport.py`：OpenSSH ControlMaster 生命周期。
 - `sshbridge/ops.py`：可复用且 JSON 就绪的桥接操作 API。
@@ -385,7 +420,7 @@ config alias。raw IPv6 应先配置 SSH alias。
 ## 测试
 
 Windows 云端适配基线与本机复现步骤见 [Windows 自动测试](docs/windows-testing.md)。
-该基线不代表 Windows Broker 或完整 MCP 工作流已经可用。
+该基线覆盖 Windows Broker 本地链路，不代表远端 Linux 工作流或桌面 MCP Host 已完成验收。
 
 ```sh
 python3 -m unittest discover -s tests -v
@@ -432,4 +467,5 @@ Git 中的原始测试文件。
 
 CLI、Connection Broker、同步/异步 Exec、Web Explorer、macOS Desktop MVP 与
 stdio MCP Server MVP、Rsync CLI/Broker MVP 已实现。Rsync Web/Desktop UI、
-Windows named pipe 和可分发的签名 Desktop 安装包仍是后续工作。
+可分发的签名 Desktop 安装包仍是后续工作。Windows named pipe Broker 已提供，
+远端 Linux 联调及 Windows 10/11 桌面验收尚未完成。

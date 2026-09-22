@@ -82,15 +82,17 @@ stdout、stderr、退出码和超时状态必须结构化返回。本地 SSH 超
 
 ## Broker 规则
 
-macOS/Linux 的 CLI、Web、Desktop 和 MCP 入口必须通过 Connection Broker 访问正式
+macOS/Linux/Windows 的 CLI、Web 和 MCP，以及 macOS Desktop 入口必须通过 Connection Broker 访问正式
 profile，不得增加 Broker 失败后的隐藏直连回退。`direct` 模式只用于显式配置的
 诊断和兼容场景。
 
-Broker 对每个 profile 只管理一个 OpenSSH ControlMaster 和一个顺序 SFTP channel。
+支持连接复用的平台上，Broker 对每个 profile 只管理一个 OpenSSH ControlMaster
+和一个顺序 SFTP channel。Windows 禁用 ControlMaster，保持一个 SFTP 长连接；
+Exec 使用独立 SSH 连接、单并发与连接频率门控，不得承诺单 TCP 复用。
 SFTP 锁不得覆盖独立 Exec I/O；Exec 通过 Broker 内的有界任务管理器限制并发。
 异步 Exec 不得绕过 Broker。长命令状态使用短连接轮询，不得长期占用 IPC response。
 
-Broker 只能监听当前用户私有运行目录中的 Unix socket。运行目录必须为 `0700`，
+macOS/Linux Broker 只能监听当前用户私有运行目录中的 Unix socket。运行目录必须为 `0700`，
 socket 和 metadata 必须为 `0600`，并保留 profile fingerprint、协议版本、
 request ID、实例 ID、单例锁和可用时的 peer UID 校验。
 
@@ -98,8 +100,11 @@ request ID、实例 ID、单例锁和可用时的 peer UID 校验。
 `broker reconnect` 可以在连接门控允许后执行一次尝试。Broker 调用 SFTP 与 Exec
 时必须使用 `connect_retries=0`。
 
-Windows named pipe 尚未实现。Windows 必须保持显式 direct 兼容路径，不得回退到
-未认证 localhost TCP Broker。
+Windows Broker 必须使用当前用户 SID ACL 保护的本地 named pipe，拒绝远程客户端，
+校验两端进程身份，并保留单例锁、profile fingerprint、实例与请求 ID 校验。
+运行文件必须使用当前用户所有权与 ACL，拒绝 reparse point 和开放权限；不得使用
+未认证 localhost TCP。Windows 保留显式 direct 诊断路径，MCP 不得回退 direct。
+Windows 不开放依赖 ControlMaster 的 Rsync。
 
 ## Rsync 规则
 
@@ -133,7 +138,8 @@ python3 -m compileall -q sshbridge remote.py
 ```
 
 MCP 行为变动还必须在安装 `requirements-mcp.txt` 的 Python 3.12 隔离环境中运行
-相同测试套件。
+相同测试套件。Windows IPC 变动还必须通过 Windows 云端的原生
+`tests/test_windows_broker.py`；Mac 的 skip 不能替代 Windows 验证。
 
 每次行为改动都应新增测试。优先添加 mock SFTP transport 或一次性 SSH 测试主机的
 操作级测试，覆盖沙箱逃逸、符号链接、原子写入、冲突检查、超时、Broker 路由、
