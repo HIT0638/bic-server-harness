@@ -221,7 +221,40 @@ class TestWindowsBroker(unittest.TestCase):
                 server.close()
             listener.close()
 
+    def test_host_job_cannot_create_a_short_lived_shared_broker(self):
+        source = """
+import json, os, win32api, win32job
+from sshbridge.broker_client import BrokerClient
+from sshbridge.config import load_config, Profile
+from sshbridge.errors import BridgeError
+job = win32job.CreateJobObject(None, '')
+info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
+info['BasicLimitInformation']['LimitFlags'] = win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
+win32job.AssignProcessToJobObject(job, win32api.GetCurrentProcess())
+config = load_config(os.environ['TEST_BRIDGE_CONFIG'])
+profile = Profile('test', config['profiles']['test'])
+try:
+    BrokerClient(config['file'], profile).ensure_started()
+except BridgeError as error:
+    print(json.dumps(error.to_dict()), flush=True)
+    os._exit(0)
+os._exit(3)
+"""
+        result = subprocess.run(
+            [sys.executable, "-u", "-c", source], cwd=str(ROOT),
+            env=dict(os.environ, TEST_BRIDGE_CONFIG=str(self.config)),
+            capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        error = json.loads(result.stdout)
+        self.assertEqual(error["code"], "BROKER_UNAVAILABLE")
+        self.assertIn("separate terminal", error["message"])
+        self.assertFalse(self.client.status()["running"])
+
     def test_real_mcp_stdio_uses_shared_broker_and_reports_errors(self):
+        # The SDK deliberately uses a non-breakaway Job Object. Bootstrap the
+        # shared Broker outside that host boundary, as documented for users.
+        self.client.ensure_started()
         from mcp import Client, StdioServerParameters
 
         async def scenario():

@@ -288,13 +288,20 @@ class BrokerClient:
         if os.name != "nt":
             kwargs["start_new_session"] = True
         else:
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            from .windows_ipc import broker_creation_flags
+            kwargs["creationflags"] = broker_creation_flags()
         try:
             process = subprocess.Popen(
                 argv, cwd=root, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 **kwargs)
         except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 5:
+                raise BridgeError(
+                    "BROKER_UNAVAILABLE",
+                    "Windows refused an independent Broker process; start the profile "
+                    "with 'remote.py broker start' in a separate terminal before opening "
+                    "the MCP Host (a restrictive Windows Job Object may prevent auto-start)")
             raise BridgeError(
                 "BROKER_UNAVAILABLE", "cannot start broker: %s" % error)
         deadline = time.monotonic() + timeout

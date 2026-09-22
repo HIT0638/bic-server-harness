@@ -294,7 +294,18 @@ job 只保存在当前 Broker 内存中，Broker 重启后旧 job ID 返回
 ```powershell
 py -3.12 -m venv .venv/mcp
 .venv/mcp/Scripts/python.exe -m pip install -r requirements-mcp.txt
+.venv/mcp/Scripts/python.exe remote.py --config "$PWD/bridge.json" broker start
 .venv/mcp/Scripts/python.exe -m sshbridge.mcp_server --config "$PWD/bridge.json"
+```
+
+先在独立 PowerShell 窗口执行上面的 `broker start`。某些 MCP Host 把子进程放进
+退出时整体终止的 Windows Job Object，并禁止子进程独立存续；这种环境无法自动
+启动共享 Broker，会明确返回 `BROKER_UNAVAILABLE`，不会退回 Host 内的短命 Broker。
+预先启动后，MCP Host 只连接现有 Broker。若终端本身也禁止独立进程，需保持一个
+外部前台 Broker 运行：
+
+```powershell
+.venv/mcp/Scripts/python.exe -m sshbridge.broker --serve --config "$PWD/bridge.json"
 ```
 
 MCP Host 中使用 Python、配置和仓库的绝对路径。例如：

@@ -16,7 +16,8 @@ Broker；真实 Windows 桌面 MCP Host 安装及 Windows 到远端 Linux 联调
 - 真实 MCP SDK 与 mock Broker 的 schema、annotations、参数映射、错误和结果上限。
 - named pipe 当前用户 ACL、匿名访问拒绝、junction 拒绝、实例抢占保护和 I/O 超时。
 - 真实 Broker 并发启动、profile 隔离、身份验证、熔断与显式重连。
-- 真实 MCP stdio 子进程共享 Broker、错误脱敏与退出后的 Broker 存续。
+- 真实 MCP stdio 子进程共享预启动 Broker、错误脱敏与退出后的 Broker 存续。
+- Host 禁止独立子进程时，自动启动明确失败，不产生退出时被 Host 连带终止的 Broker。
 - Python 编译检查。
 
 SDK 导入失败、任何测试失败或跳过均使工作流失败，不把可选依赖缺失当作成功。

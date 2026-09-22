@@ -104,7 +104,8 @@ Windows Broker 必须使用当前用户 SID ACL 保护的本地 named pipe，拒
 校验两端进程身份，并保留单例锁、profile fingerprint、实例与请求 ID 校验。
 运行文件必须使用当前用户所有权与 ACL，拒绝 reparse point 和开放权限；不得使用
 未认证 localhost TCP。Windows 保留显式 direct 诊断路径，MCP 不得回退 direct。
-Windows 不开放依赖 ControlMaster 的 Rsync。
+Windows 不开放依赖 ControlMaster 的 Rsync。受 Windows Job Object 限制时，Broker
+自动启动必须失败并提示从外部终端启动；不得忽略限制并生成随 MCP Host 退出的共享 Broker。
 
 ## Rsync 规则
 

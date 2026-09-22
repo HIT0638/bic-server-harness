@@ -41,6 +41,7 @@ def _api(lib, name, result, *args):
 
 
 _api(K, "GetCurrentProcess", HANDLE)
+_api(K, "IsProcessInJob", W.BOOL, HANDLE, HANDLE, C.POINTER(W.BOOL))
 _api(K, "OpenProcess", HANDLE, DWORD, W.BOOL, DWORD)
 _api(K, "CloseHandle", W.BOOL, HANDLE)
 _api(K, "LocalFree", PTR, PTR)
@@ -100,6 +101,18 @@ def _process_sid(process):
 
 def current_sid():
     return _process_sid(K.GetCurrentProcess())
+
+
+def broker_creation_flags():
+    import subprocess
+    in_job = W.BOOL()
+    _check(K.IsProcessInJob(K.GetCurrentProcess(), None, C.byref(in_job)))
+    flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    if in_job.value:
+        # Windows itself enforces whether the host permits breakaway. Never
+        # retry without this flag: that would let host exit kill shared state.
+        flags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
+    return flags
 
 
 class PrivateSecurity:
