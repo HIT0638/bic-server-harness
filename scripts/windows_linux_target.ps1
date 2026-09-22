@@ -50,7 +50,7 @@ useradd --create-home --shell /bin/sh sshbridge-test
 passwd -d sshbridge-test
 mkdir -p /run/sshd
 '@
-& wsl.exe -d $name -u root -- /bin/sh -c ($bootstrap -replace "`r", '')
+& wsl.exe -d $name -u root --exec /bin/sh -c ($bootstrap -replace "`r", '')
 if ($LASTEXITCODE -ne 0) { throw 'Linux SSH test target provisioning failed.' }
 "SSHBRIDGE_WSL_DISTRO=$name" | Add-Content $env:GITHUB_ENV
 $output = '.test-runtime/windows-linux'

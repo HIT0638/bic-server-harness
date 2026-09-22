@@ -35,16 +35,20 @@ class WslSshd:
         self.port = None
 
     def linux(self, *args, timeout=30):
-        return subprocess.run(
-            ["wsl.exe", "-d", self.distribution, "-u", "root", "--", *args],
-            check=True, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=timeout).stdout.strip()
+        result = subprocess.run(
+            ["wsl.exe", "-d", self.distribution, "-u", "root", "--exec", *args],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout)
+        if result.returncode:
+            raise RuntimeError("WSL test setup failed (%s): %s" % (
+                result.returncode, (result.stderr + result.stdout)[-4000:]))
+        return result.stdout.strip()
 
     def shell(self, source, timeout=30):
         return self.linux("/bin/sh", "-c", source, timeout=timeout)
 
     def mapped(self, path):
-        return self.linux("wslpath", "-a", "-u", str(path))
+        return self.linux("wslpath", "-a", "-u", Path(path).as_posix())
 
     def start(self):
         from sshbridge.config import Profile
