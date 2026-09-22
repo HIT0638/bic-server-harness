@@ -57,7 +57,7 @@ class BrokerState:
             profile,
             self.transport,
             remote_stat=self._rsync_remote_stat,
-            remote_probe=self._execute,
+            remote_probe=self._rsync_remote_probe,
             on_transport_error=self._mark_open)
 
     def snapshot(self):
@@ -313,6 +313,13 @@ class BrokerState:
 
     def _rsync_remote_stat(self, path):
         return self._run_sftp_op("stat", {"path": path})
+
+    def _rsync_remote_probe(self, command):
+        return self._execute(
+            self.profile,
+            command,
+            self.profile.root,
+            self.profile.connect_timeout)
 
     def _probe_direct_connection(self):
         self._begin_direct_connection()

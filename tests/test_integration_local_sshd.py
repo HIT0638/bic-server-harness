@@ -2,8 +2,10 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -465,6 +467,212 @@ class TestLocalSshdIntegration(unittest.TestCase):
              "--config", str(self.server.config_path)] + list(arguments),
             cwd=PROJECT_ROOT, env=env, capture_output=True, text=True,
             timeout=30)
+
+
+def _compatible_rsync():
+    candidates = [
+        "/opt/homebrew/bin/rsync",
+        "/usr/local/bin/rsync",
+        shutil.which("rsync"),
+    ]
+    for candidate in candidates:
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        completed = subprocess.run(
+            [candidate, "--help"],
+            capture_output=True, text=True, timeout=5)
+        if completed.returncode == 0 \
+                and (
+                    "--protect-args" in completed.stdout
+                    or "--secluded-args" in completed.stdout):
+            return os.path.abspath(candidate)
+    return None
+
+
+class TestRsyncLocalSshdIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rsync_bin = _compatible_rsync()
+        if cls.rsync_bin is None:
+            raise unittest.SkipTest(
+                "compatible rsync with --protect-args is unavailable")
+        cls.server = LocalSshd()
+        cls.previous_state_dir = os.environ.get("SSHBRIDGE_STATE_DIR")
+        cls.local_temp = tempfile.TemporaryDirectory(
+            prefix="sshbridge-rsync-local-")
+        try:
+            cls.server.start()
+            os.environ["SSHBRIDGE_STATE_DIR"] = str(
+                cls.server.daemon_state)
+            with open(
+                    cls.server.config_path, "r",
+                    encoding="utf-8") as stream:
+                config = json.load(stream)
+            raw = config["profiles"]["local-test"]
+            raw["rsync_bin"] = cls.rsync_bin
+            raw["remote_rsync_bin"] = cls.rsync_bin
+            with open(
+                    cls.server.config_path, "w",
+                    encoding="utf-8") as stream:
+                json.dump(config, stream, indent=2)
+                stream.write("\n")
+            cls.profile = Profile("local-test", raw)
+            cls.client = BrokerClient(
+                str(cls.server.config_path), cls.profile)
+            cls.client.ensure_started()
+        except LocalSshdUnavailable as error:
+            cls.server.stop()
+            cls.local_temp.cleanup()
+            raise unittest.SkipTest(str(error))
+        except Exception:
+            cls.server.stop()
+            cls.local_temp.cleanup()
+            cls._restore_state_dir()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "client", None) is not None:
+            cls.client.stop()
+        cls.server.stop()
+        cls.local_temp.cleanup()
+        cls._restore_state_dir()
+
+    @classmethod
+    def _restore_state_dir(cls):
+        if cls.previous_state_dir is None:
+            os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+        else:
+            os.environ["SSHBRIDGE_STATE_DIR"] = cls.previous_state_dir
+
+    def wait_job(self, job_id, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = self.client.request(
+                "sync_status", {"job_id": job_id}, timeout=5)
+            if result["state"] in ("succeeded", "failed", "cancelled"):
+                return result
+            time.sleep(0.02)
+        self.fail("sync job did not finish: %s" % job_id)
+
+    def run_cli(self, *arguments):
+        return subprocess.run(
+            [sys.executable, str(REMOTE_PY),
+             "--config", str(self.server.config_path)] + list(arguments),
+            cwd=PROJECT_ROOT, env=os.environ.copy(),
+            capture_output=True, text=True, timeout=30)
+
+    def test_real_push_pull_and_cli_status(self):
+        local_root = Path(self.local_temp.name) / "real-flow"
+        local_root.mkdir()
+        source_file = local_root / "one file.txt"
+        source_file.write_text("one\n", encoding="utf-8")
+        source_dir = local_root / "source dir"
+        source_dir.mkdir()
+        (source_dir / "nested.txt").write_text(
+            "nested\n", encoding="utf-8")
+
+        remote_destination = self.server.workspace / "sync target"
+        remote_destination.mkdir()
+        started = self.run_cli(
+            "--json", "sync", "push",
+            str(source_file), str(source_dir),
+            "--to", "/sync target")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        push = json.loads(started.stdout)
+        self.assertTrue(push["ok"])
+        pushed = self.wait_job(push["job_id"])
+        self.assertEqual(pushed["state"], "succeeded", pushed)
+        self.assertGreaterEqual(pushed["files_transferred"], 2)
+        self.assertEqual(
+            (remote_destination / "one file.txt").read_text(
+                encoding="utf-8"),
+            "one\n")
+        self.assertEqual(
+            (remote_destination / "source dir" / "nested.txt").read_text(
+                encoding="utf-8"),
+            "nested\n")
+
+        status = self.run_cli(
+            "--json", "sync", "status", push["job_id"])
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["state"], "succeeded")
+
+        remote_source = self.server.workspace / "pull source"
+        remote_source.mkdir()
+        (remote_source / "remote.txt").write_text(
+            "remote\n", encoding="utf-8")
+        local_destination = local_root / "downloads"
+        local_destination.mkdir()
+        pull = self.client.request("sync_start", {
+            "direction": "pull",
+            "sources": ["/pull source"],
+            "destination": str(local_destination),
+        })
+        pulled = self.wait_job(pull["job_id"])
+        self.assertEqual(pulled["state"], "succeeded", pulled)
+        self.assertEqual(
+            (local_destination / "pull source" / "remote.txt").read_text(
+                encoding="utf-8"),
+            "remote\n")
+        self.assertEqual(self.client.status()["tcp_generation"], 1)
+
+    def test_symlink_escape_is_rejected_for_push_and_pull(self):
+        outside_file = self.server.outside / "secret.txt"
+        outside_file.write_text("secret", encoding="utf-8")
+        escape = self.server.workspace / "rsync-escape"
+        os.symlink(self.server.outside, escape)
+        source = Path(self.local_temp.name) / "safe-source.txt"
+        source.write_text("safe", encoding="utf-8")
+
+        for direction, sources, destination in (
+                ("push", [str(source)], "/rsync-escape"),
+                ("pull", ["/rsync-escape/secret.txt"],
+                 self.local_temp.name)):
+            with self.subTest(direction=direction):
+                with self.assertRaises(BridgeError) as caught:
+                    self.client.request("sync_start", {
+                        "direction": direction,
+                        "sources": sources,
+                        "destination": destination,
+                    })
+                self.assertEqual(
+                    caught.exception.code, "SANDBOX_VIOLATION")
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "secret")
+
+    def test_incompatible_remote_rsync_does_not_break_sftp(self):
+        bad_config = self.server.base / "bridge.rsync-old.json"
+        raw = dict(self.server.profile_raw)
+        raw["rsync_bin"] = self.rsync_bin
+        raw["remote_rsync_bin"] = "/usr/bin/rsync"
+        with open(bad_config, "w", encoding="utf-8") as stream:
+            json.dump({
+                "default_profile": "old-rsync",
+                "profiles": {"old-rsync": raw},
+            }, stream)
+            stream.write("\n")
+        profile = Profile("old-rsync", raw)
+        client = BrokerClient(str(bad_config), profile)
+        source = Path(self.local_temp.name) / "old-rsync-source.txt"
+        source.write_text("source", encoding="utf-8")
+        try:
+            client.ensure_started()
+            with self.assertRaises(BridgeError) as caught:
+                client.request("sync_start", {
+                    "direction": "push",
+                    "sources": [str(source)],
+                    "destination": "/",
+                })
+            self.assertEqual(
+                caught.exception.code, "RSYNC_UNAVAILABLE")
+            self.assertEqual(
+                caught.exception.details["stage"], "remote")
+            self.assertEqual(
+                client.request("list_dir", {"path": "/"})["op"],
+                "list_dir")
+            self.assertEqual(client.status()["state"], "READY")
+        finally:
+            client.stop()
 
 
 if __name__ == "__main__":

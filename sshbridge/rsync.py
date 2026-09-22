@@ -225,7 +225,7 @@ class RsyncManager:
             self._capability_failed(
                 "local", "local rsync capability probe returned nonzero")
         local_help = (help_result.stdout or "") + (help_result.stderr or "")
-        if "--protect-args" not in local_help:
+        if not _supports_protected_args(local_help):
             self._capability_failed(
                 "local", "local rsync does not support --protect-args")
 
@@ -247,7 +247,7 @@ class RsyncManager:
         remote_text = (
             (remote.get("stdout") or "")
             + (remote.get("stderr") or ""))
-        if "--protect-args" not in remote_text:
+        if not _supports_protected_args(remote_text):
             self._capability_failed(
                 "remote", "remote rsync does not support --protect-args")
 
@@ -352,10 +352,10 @@ class RsyncManager:
         return canonical
 
     def _build_argv(self, direction, sources, destination):
-        ssh_argv = self.profile.ssh_argv([
+        ssh_argv = self.profile.ssh_argv() + [
             "-S", self.transport.control_path,
             "-o", "ControlMaster=no",
-        ])
+        ]
         argv = [
             self._resolved_rsync_bin,
             "--recursive",
@@ -528,6 +528,10 @@ def _unknown_capability():
         "remote_version": None,
         "reason": None,
     }
+
+
+def _supports_protected_args(help_text):
+    return "--protect-args" in help_text or "--secluded-args" in help_text
 
 
 def _first_line(value):

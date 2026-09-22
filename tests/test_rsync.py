@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from sshbridge.config import Profile
 from sshbridge.errors import BridgeError
 from sshbridge.rsync import (
-    MAX_HISTORY, MAX_OUTPUT_BYTES, MAX_QUEUE, RsyncManager)
+    MAX_HISTORY, MAX_OUTPUT_BYTES, MAX_QUEUE, MAX_SOURCES, RsyncManager)
 
 
 def profile_raw(**overrides):
@@ -77,20 +77,22 @@ class FakePopen:
         return self.processes.pop(0)
 
 
-def capability_result(protect_args=True):
+def capability_result(protect_args=True, option_name="--protect-args"):
     help_text = "Usage: rsync\n"
     if protect_args:
-        help_text += "  -s, --protect-args\n"
+        help_text += "  -s, %s\n" % option_name
     return SimpleNamespace(
         returncode=0,
         stdout="rsync version 3.2.7\n" + help_text,
         stderr="")
 
 
-def remote_result(protect_args=True, exit_code=0, stderr=""):
+def remote_result(
+        protect_args=True, exit_code=0, stderr="",
+        option_name="--protect-args"):
     help_text = "Usage: rsync\n"
     if protect_args:
-        help_text += "  -s, --protect-args\n"
+        help_text += "  -s, %s\n" % option_name
     return {
         "exit_code": exit_code,
         "stdout": "rsync version 3.2.7\n" + help_text,
@@ -147,27 +149,29 @@ class RsyncManagerCase(unittest.TestCase):
 
     def test_push_builds_fixed_argv_and_parses_stats(self):
         output = (
-            b"Number of regular files transferred: 2\n"
+            b"Number of regular files transferred: 3\n"
             b"Total transferred file size: 1,234 bytes\n")
         popen = FakePopen(FakeProcess(stdout=output))
         with tempfile.TemporaryDirectory() as directory:
             first = os.path.join(directory, "one file.txt")
             second = os.path.join(directory, "-two")
-            with open(first, "w", encoding="utf-8") as stream:
-                stream.write("one")
-            with open(second, "w", encoding="utf-8") as stream:
-                stream.write("two")
+            third = os.path.join(directory, "quo'te:three")
+            for path, content in (
+                    (first, "one"), (second, "two"), (third, "three")):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(content)
             manager = self.manager(popen)
             try:
                 started = manager.start(
-                    "push", [first, second, first], "/output")
+                    "push", [first, second, third, first],
+                    "/out put:quote'")
                 result = self.wait_state(
                     manager, started["job_id"], {"succeeded"})
             finally:
                 manager.close()
 
-        self.assertEqual(result["source_count"], 2)
-        self.assertEqual(result["files_transferred"], 2)
+        self.assertEqual(result["source_count"], 3)
+        self.assertEqual(result["files_transferred"], 3)
         self.assertEqual(result["bytes_transferred"], 1234)
         argv, kwargs = popen.calls[0]
         self.assertIn("--protect-args", argv)
@@ -176,14 +180,15 @@ class RsyncManagerCase(unittest.TestCase):
             "--rsync-path=/usr/local/bin/rsync", argv)
         separator = argv.index("--")
         self.assertEqual(
-            argv[separator + 1:separator + 3], [first, second])
+            argv[separator + 1:separator + 4], [first, second, third])
         self.assertEqual(
-            argv[-1], "legacy-host:/srv/workspace/output")
+            argv[-1],
+            "legacy-host:/srv/workspace/out put:quote'")
         shell = argv[argv.index("-e") + 1]
         self.assertIn("-S /tmp/sshbridge-control", shell)
         self.assertIn("ProxyJump=jump-host", shell)
         self.assertNotIn(directory, shell)
-        self.assertNotIn("/srv/workspace/output", shell)
+        self.assertNotIn("/srv/workspace/out put", shell)
         self.assertTrue(kwargs["start_new_session"])
         self.assertEqual(kwargs["env"]["LC_ALL"], "C")
 
@@ -205,6 +210,35 @@ class RsyncManagerCase(unittest.TestCase):
             "legacy-host:/srv/workspace/notes.txt")
         self.assertEqual(argv[separator + 2], destination)
         self.assertEqual(result["direction"], "pull")
+
+    def test_controlmaster_options_follow_profile_ssh_args(self):
+        profile = Profile("test", profile_raw(ssh_args=[
+            "-S", "/tmp/untrusted-control",
+            "-o", "ControlMaster=yes",
+        ]))
+        popen = FakePopen(FakeProcess())
+        with tempfile.NamedTemporaryFile() as source:
+            manager = RsyncManager(
+                profile, self.transport,
+                remote_stat=self.remote_stat,
+                remote_probe=self.remote_probe,
+                popen_factory=popen,
+                run_local=lambda *args, **kwargs: capability_result())
+            try:
+                started = manager.start(
+                    "push", [source.name], "/output")
+                self.wait_state(
+                    manager, started["job_id"], {"succeeded"})
+            finally:
+                manager.close()
+        shell = popen.calls[0][0][
+            popen.calls[0][0].index("-e") + 1]
+        self.assertGreater(
+            shell.rfind("/tmp/sshbridge-control"),
+            shell.rfind("/tmp/untrusted-control"))
+        self.assertGreater(
+            shell.rfind("ControlMaster=no"),
+            shell.rfind("ControlMaster=yes"))
 
     def test_requires_protect_args_and_controlmaster(self):
         manager = self.manager(
@@ -233,6 +267,58 @@ class RsyncManagerCase(unittest.TestCase):
         finally:
             manager.close()
 
+        remote_calls = []
+
+        def incompatible_remote(command):
+            remote_calls.append(command)
+            return remote_result(protect_args=False)
+
+        manager = RsyncManager(
+            self.profile,
+            self.transport,
+            remote_stat=self.remote_stat,
+            remote_probe=incompatible_remote,
+            popen_factory=FakePopen(),
+            run_local=lambda *args, **kwargs: capability_result())
+        try:
+            with tempfile.NamedTemporaryFile() as source:
+                for _ in range(2):
+                    with self.assertRaises(BridgeError) as caught:
+                        manager.start("push", [source.name], "/output")
+                    self.assertEqual(
+                        caught.exception.code, "RSYNC_UNAVAILABLE")
+                    self.assertEqual(
+                        caught.exception.details["stage"], "remote")
+            self.assertEqual(len(remote_calls), 1)
+        finally:
+            manager.close()
+
+    def test_accepts_modern_secluded_args_help_name(self):
+        local_calls = []
+
+        def run_local(*args, **kwargs):
+            local_calls.append(args[0])
+            return capability_result(option_name="--secluded-args")
+
+        manager = RsyncManager(
+            self.profile,
+            self.transport,
+            remote_stat=self.remote_stat,
+            remote_probe=lambda command: remote_result(
+                option_name="--secluded-args"),
+            popen_factory=FakePopen(FakeProcess()),
+            run_local=run_local)
+        try:
+            with tempfile.NamedTemporaryFile() as source:
+                started = manager.start(
+                    "push", [source.name], "/output")
+                result = self.wait_state(
+                    manager, started["job_id"], {"succeeded"})
+        finally:
+            manager.close()
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual(len(local_calls), 2)
+
     def test_rejects_unsafe_inputs_before_spawning(self):
         manager = self.manager(FakePopen())
         try:
@@ -246,6 +332,12 @@ class RsyncManagerCase(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "NOT_FOUND")
             with self.assertRaises(BridgeError) as caught:
                 manager.start("pull", ["/notes.txt", "/more.txt"], "/tmp")
+            self.assertEqual(caught.exception.code, "INVALID_ARG")
+            with tempfile.NamedTemporaryFile() as source:
+                with self.assertRaises(BridgeError) as caught:
+                    manager.start(
+                        "push", [source.name] * (MAX_SOURCES + 1),
+                        "/output")
             self.assertEqual(caught.exception.code, "INVALID_ARG")
         finally:
             manager.close()
@@ -289,6 +381,10 @@ class RsyncManagerCase(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     manager.start("push", [source.name], "/output")
                 self.assertEqual(caught.exception.code, "SYNC_QUEUE_FULL")
+                queued_cancelled = manager.cancel(jobs[-1]["job_id"])
+                self.assertEqual(queued_cancelled["state"], "cancelled")
+                self.assertFalse(
+                    queued_cancelled["remote_termination_unknown"])
                 cancelled = manager.cancel(first["job_id"])
                 self.assertTrue(cancelled["cancel_requested"])
                 finished = self.wait_state(

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import socket
@@ -15,6 +16,7 @@ from sshbridge.broker_client import (
 from sshbridge.config import Profile
 from sshbridge.errors import BridgeError
 from sshbridge.exec_client import is_ssh_transport_failure
+from sshbridge.rsync import RsyncManager
 from sshbridge.sftp_client import _is_connect_failure
 
 
@@ -377,9 +379,10 @@ class TestBrokerSyncRouting(unittest.TestCase):
         self.profile = Profile("test", profile_raw())
         self.endpoint = BrokerEndpoint("/tmp/bridge.json", self.profile)
         self.manager = FakeRsyncManager()
+        self.rsync_factory = mock.Mock(return_value=self.manager)
         patcher = mock.patch(
             "sshbridge.broker.RsyncManager",
-            return_value=self.manager)
+            self.rsync_factory)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.state = BrokerState(
@@ -420,6 +423,113 @@ class TestBrokerSyncRouting(unittest.TestCase):
             self.state.run(
                 "sync_cancel", {"job_id": "job-1"})["state"],
             "cancelled")
+
+    def test_rsync_probe_callback_adapts_exec_arguments(self):
+        remote_probe = self.rsync_factory.call_args.kwargs["remote_probe"]
+        self.state._execute = mock.Mock(return_value={"exit_code": 0})
+        result = remote_probe("rsync --version")
+        self.assertEqual(result, {"exit_code": 0})
+        self.state._execute.assert_called_once_with(
+            self.profile,
+            "rsync --version",
+            self.profile.root,
+            self.profile.connect_timeout)
+
+    def test_running_sync_does_not_hold_sftp_or_exec_capacity(self):
+        class BlockingProcess:
+            def __init__(self):
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.returncode = None
+                self.pid = 50001
+                self.done = threading.Event()
+
+            def wait(self):
+                self.done.wait(2)
+                return self.returncode
+
+            def finish(self, returncode=0):
+                self.returncode = returncode
+                self.done.set()
+
+        process = BlockingProcess()
+        spawned = threading.Event()
+
+        def popen(*args, **kwargs):
+            _ = (args, kwargs)
+            spawned.set()
+            return process
+
+        capability = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "rsync version 3.2.7\n"
+                "  -s, --secluded-args\n"),
+            stderr="")
+        exec_result = {
+            "command": "true",
+            "cwd": self.profile.root,
+            "stdout": (
+                "rsync version 3.2.7\n"
+                "  -s, --secluded-args\n"),
+            "stderr": "",
+            "exit_code": 0,
+            "timed_out": False,
+            "remote_may_still_be_running": False,
+        }
+        session = SimpleNamespace(_closed=False)
+
+        def dispatch_sftp(operation, arguments, active_session):
+            _ = active_session
+            if operation == "stat":
+                return {
+                    "path": arguments["path"],
+                    "real_path": self.profile.root,
+                    "type": "dir",
+                }
+            return {"op": operation}
+
+        self.state.rsync.close()
+        self.state.transport.is_alive = mock.Mock(return_value=True)
+        self.state.state = "READY"
+        self.state._session_unlocked = mock.Mock(return_value=session)
+        self.state._dispatch_sftp = mock.Mock(side_effect=dispatch_sftp)
+        self.state.rsync = RsyncManager(
+            self.profile,
+            self.state.transport,
+            remote_stat=self.state._rsync_remote_stat,
+            remote_probe=self.state._rsync_remote_probe,
+            popen_factory=popen,
+            run_local=lambda *args, **kwargs: capability,
+            terminate_process=lambda active: active.finish(-15))
+
+        with tempfile.NamedTemporaryFile() as source:
+            with mock.patch(
+                    "sshbridge.broker.run_exec",
+                    return_value=exec_result):
+                started = self.state.run("sync_start", {
+                    "direction": "push",
+                    "sources": [source.name],
+                    "destination": "/",
+                })
+                self.assertTrue(spawned.wait(1))
+                self.assertEqual(
+                    self.state.rsync.status(started["job_id"])["state"],
+                    "running")
+                self.assertEqual(
+                    self.state.run("list_dir", {"path": "/"})["op"],
+                    "list_dir")
+                self.assertEqual(
+                    self.state.run("exec", {"command": "true"})["exit_code"],
+                    0)
+
+        process.finish()
+        for _ in range(100):
+            status = self.state.rsync.status(started["job_id"])
+            if status["state"] == "succeeded":
+                break
+            threading.Event().wait(0.01)
+        self.assertEqual(status["state"], "succeeded")
 
     def test_reconnect_invalidates_capability_and_close_stops_manager(self):
         self.state.transport.stop = mock.Mock()
