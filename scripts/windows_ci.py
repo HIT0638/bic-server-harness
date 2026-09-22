@@ -41,6 +41,7 @@ def main(argv=None):
         "suite": list(TEST_MODULES),
         "not_verified": [
             "OpenSSH ControlMaster runtime support and connection reuse",
+            "Automatic background Broker launch outside restrictive Windows Job Objects",
             "Interactive Windows 10/11 MCP Host installation and launch",
             "Windows-to-Linux SFTP, remote exec and reconnect",
             "Rsync and desktop packaging",

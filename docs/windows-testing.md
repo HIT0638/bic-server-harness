@@ -15,7 +15,7 @@ Broker；真实 Windows 桌面 MCP Host 安装及 Windows 到远端 Linux 联调
 - 原生 Python 子进程的输出、退出码、取消、超时，以及含空格和中文的本地工作目录。
 - 真实 MCP SDK 与 mock Broker 的 schema、annotations、参数映射、错误和结果上限。
 - named pipe 当前用户 ACL、匿名访问拒绝、junction 拒绝、实例抢占保护和 I/O 超时。
-- 真实 Broker 并发启动、profile 隔离、身份验证、熔断与显式重连。
+- 真实前台 Broker 并发启动、profile 隔离、身份验证、熔断与显式重连。
 - 真实 MCP stdio 子进程共享预启动 Broker、错误脱敏与退出后的 Broker 存续。
 - Host 禁止独立子进程时，自动启动明确失败，不产生退出时被 Host 连带终止的 Broker。
 - Python 编译检查。
@@ -52,6 +52,12 @@ py -3.12 -m venv .venv/windows-ci
 Mac/Linux 可省略 `--require-windows` 检查同一套基础测试，但结果不能作为 Windows 验收。
 现有全量测试含 POSIX 专用断言、`/bin/sh` 和隔离 POSIX sshd，不能直接在 Windows 全量发现。
 Windows 当前只运行脚本明确列出的测试，未选入的测试不是已通过，也不是静默跳过。
+
+GitHub Windows runner 本身也使用禁止 breakaway 的 Job Object。测试明确运行独立的
+`python -m sshbridge.broker --serve` 进程，仍受 CI 生命周期约束；MCP 子进程连接这个
+已运行的 Broker。测试不修改 runner 或 Host 的 Job Object，不绕过其退出清理策略。
+自动后台启动成功的路径仍需在允许独立进程的实际用户环境验收；受限环境中的明确拒绝
+已纳入自动测试。
 
 ## 后续验收
 

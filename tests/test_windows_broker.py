@@ -51,14 +51,49 @@ class TestWindowsBroker(unittest.TestCase):
         }), encoding="utf-8")
         self.client = BrokerClient(str(self.config), self.profile)
         self.extra_clients = []
+        self.broker_processes = []
 
     def tearDown(self):
         try:
             for client in self.extra_clients + [self.client]:
                 client.stop()
         finally:
+            for process, log in self.broker_processes:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                log.close()
             self.patch.stop()
             self.temp.cleanup()
+
+    def start_broker(self, client=None, count=1):
+        """Explicit foreground services stay inside the CI job, outside MCP jobs.
+
+        Hosted Windows runners prohibit breakaway themselves. Never change that
+        policy or substitute a mock for IPC: launch the documented --serve mode.
+        """
+        client = client or self.client
+        for _ in range(count):
+            log = (self.base / ("broker-%s.log" % len(self.broker_processes))).open("w+b")
+            process = subprocess.Popen(
+                [sys.executable, "-m", "sshbridge.broker", "--serve",
+                 "--config", str(self.config), "--profile", client.profile.name],
+                cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
+            self.broker_processes.append((process, log))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                return client.ping()
+            except BridgeError:
+                time.sleep(0.05)
+        messages = []
+        for _, log in self.broker_processes:
+            log.seek(0)
+            messages.append(log.read().decode("utf-8", "replace"))
+        self.fail("Foreground Broker failed to start: %s" % " ".join(messages))
 
     def assert_error(self, code, function, *args, **kwargs):
         with self.assertRaises(BridgeError) as caught:
@@ -73,7 +108,7 @@ class TestWindowsBroker(unittest.TestCase):
         self.assertIn("ControlMaster=no", profile.sftp_argv())
 
     def test_runtime_and_metadata_are_current_user_only(self):
-        self.client.ensure_started()
+        self.start_broker()
         endpoint = self.client.endpoint
         self.ipc.check_private_path(endpoint.runtime_dir, directory=True)
         self.ipc.check_private_path(endpoint.metadata_path)
@@ -96,7 +131,7 @@ class TestWindowsBroker(unittest.TestCase):
         self.assert_error("BROKER_UNAVAILABLE", self.ipc.check_private_path, path, directory=True)
 
     def test_anonymous_client_cannot_open_pipe(self):
-        self.client.ensure_started()
+        self.start_broker()
         impersonate = self.ipc._api(self.ipc.A, "ImpersonateAnonymousToken", W.BOOL, W.HANDLE)
         revert = self.ipc._api(self.ipc.A, "RevertToSelf", W.BOOL)
         current_thread = self.ipc._api(self.ipc.K, "GetCurrentThread", W.HANDLE)
@@ -125,7 +160,8 @@ class TestWindowsBroker(unittest.TestCase):
         finally:
             os.rmdir(junction)
 
-    def test_concurrent_clients_share_one_detached_broker(self):
+    def test_concurrent_start_and_clients_share_one_broker(self):
+        self.start_broker(count=4)
         clients = [BrokerClient(str(self.config), self.profile) for _ in range(4)]
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda client: client.ensure_started(timeout=15), clients))
@@ -139,7 +175,7 @@ class TestWindowsBroker(unittest.TestCase):
         self.assertFalse(self.client.status()["running"])
 
     def test_failed_connection_pauses_until_explicit_reconnect(self):
-        self.client.ensure_started()
+        self.start_broker()
         self.assert_error("SSH_ERROR", self.client.request, "list_dir", {"path": "/"})
         opened = self.client.status()
         self.assertEqual(opened["state"], "OPEN")
@@ -149,7 +185,7 @@ class TestWindowsBroker(unittest.TestCase):
         self.assertEqual(self.client.status()["failure_count"], 2)
 
     def test_protocol_identity_is_checked(self):
-        self.client.ensure_started()
+        self.start_broker()
         endpoint = self.client.endpoint
         connection = self.ipc.connect(endpoint.socket_path, 2, endpoint.read_metadata()["pid"])
         try:
@@ -170,7 +206,7 @@ class TestWindowsBroker(unittest.TestCase):
             endpoint.socket_path, 2, os.getpid())
 
     def test_invalid_metadata_is_rejected(self):
-        self.client.ensure_started()
+        self.start_broker()
         path = Path(self.client.endpoint.metadata_path)
         original = path.read_text(encoding="utf-8")
         try:
@@ -181,14 +217,14 @@ class TestWindowsBroker(unittest.TestCase):
             path.write_text(original, encoding="utf-8")
 
     def test_profiles_are_isolated(self):
-        first = self.client.ensure_started()
+        first = self.start_broker()
         other = BrokerClient(str(self.config), Profile("other", self.raw))
         # Config must include both independently bound profiles.
         self.config.write_text(json.dumps({
             "profiles": {"test": self.raw, "other": self.raw},
         }), encoding="utf-8")
         self.extra_clients.append(other)
-        second = other.ensure_started()
+        second = self.start_broker(other)
         self.assertNotEqual(first["instance_id"], second["instance_id"])
         self.assertNotEqual(self.client.endpoint.socket_path, other.endpoint.socket_path)
         other.stop()
@@ -254,7 +290,7 @@ os._exit(3)
     def test_real_mcp_stdio_uses_shared_broker_and_reports_errors(self):
         # The SDK deliberately uses a non-breakaway Job Object. Bootstrap the
         # shared Broker outside that host boundary, as documented for users.
-        self.client.ensure_started()
+        self.start_broker()
         from mcp import Client, StdioServerParameters
 
         async def scenario():
