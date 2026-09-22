@@ -216,7 +216,8 @@ class TestMcpCommand(unittest.TestCase):
             profile_raw(connection_policy={"mode": "direct"}))
         with self.assertRaises(BridgeError) as direct:
             mcp_server.create_mcp_server(
-                direct_profile, "/tmp/bridge.json", mcp_module=object())
+                direct_profile, os.path.abspath("unused-bridge.json"),
+                mcp_module=object())
         self.assertEqual(direct.exception.code, "BROKER_UNSUPPORTED")
 
     def test_direct_profile_is_rejected_before_sdk_start(self):
@@ -275,7 +276,7 @@ class TestMcpServer(unittest.IsolatedAsyncioTestCase):
         )
         self.server = mcp_server.create_mcp_server(
             self.profile,
-            "/tmp/bridge.json",
+            os.path.abspath("unused-bridge.json"),
             mcp_module=sdk,
             broker_client_factory=lambda _config, _profile: self.broker,
         )
