@@ -21,6 +21,21 @@ Desktop 继续复用现有 Remote Explorer：
 本期不实现签名、公证、DMG、自动更新、Windows/Linux Desktop、多窗口、profile
 切换、配置编辑器或原生 UI 重写。
 
+### 目标架构
+
+```mermaid
+flowchart TB
+    subgraph App["Remote Explorer.app"]
+        Cocoa["主线程：Cocoa / pywebview"]
+        HTTP["后台线程：loopback HTTP"]
+        Assets["Web assets"]
+        Cocoa --> HTTP
+        HTTP --> Assets
+    end
+    HTTP -->|"Unix socket"| Broker["共享 Connection Broker"]
+    Broker -->|"ControlMaster / SFTP"| Remote["远端工作区"]
+```
+
 ## Current State Analysis
 
 ### Repository

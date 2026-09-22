@@ -47,6 +47,27 @@ def is_ssh_transport_failure(stderr_text):
     return any(marker in text for marker in markers)
 
 
+def build_exec_argv(profile, command, cwd):
+    """Build the local OpenSSH argv for one remote shell command."""
+    remote = "cd %s && %s" % (shlex.quote(cwd), command)
+    return profile.exec_argv(remote)
+
+
+def start_exec(profile, command, cwd):
+    """Start one OpenSSH command process with binary output pipes."""
+    try:
+        return subprocess.Popen(
+            build_exec_argv(profile, command, cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+    except FileNotFoundError:
+        raise BridgeError(
+            "SSH_ERROR", "ssh binary not found: %r" % profile.ssh_bin)
+
+
 def run_exec(profile, command, cwd, timeout, connect_retries=2, retry_delay=3.0):
     """Run `command` on the remote host with cwd as working directory.
 
@@ -54,8 +75,7 @@ def run_exec(profile, command, cwd, timeout, connect_retries=2, retry_delay=3.0)
     On timeout the local ssh process is killed; the remote process may keep
     running (a limitation of plain OpenSSH without remote cooperation).
     """
-    remote = "cd %s && %s" % (shlex.quote(cwd), command)
-    argv = profile.exec_argv(remote)
+    argv = build_exec_argv(profile, command, cwd)
     attempts = connect_retries + 1
     for attempt in range(attempts):
         try:

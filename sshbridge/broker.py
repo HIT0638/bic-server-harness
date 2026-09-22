@@ -20,7 +20,8 @@ from .broker_client import (MAX_MESSAGE, PROTOCOL_VERSION, BrokerEndpoint,
                             _read_message)
 from .config import Profile, load_config
 from .errors import BridgeError
-from .exec_client import is_ssh_transport_failure, run_exec
+from .exec_client import is_ssh_transport_failure, run_exec, start_exec
+from .exec_jobs import EXEC_CANCEL_GRACE, ExecJobManager
 from .rsync import RsyncManager
 from .sftp_client import SftpSession
 from .transport import OpenSSHTransport
@@ -37,7 +38,6 @@ class BrokerState:
         self.exec_limit = (
             self.policy["exec_concurrency"]
             if self.transport.multiplexing else 1)
-        self.exec_semaphore = threading.BoundedSemaphore(self.exec_limit)
         self.connect_lock = threading.RLock()
         self.sftp_lock = threading.Lock()
         self.state_lock = threading.Lock()
@@ -49,18 +49,31 @@ class BrokerState:
         self.last_error = None
         self.failure_count = 0
         self.cooldown_until = 0
-        self.active_exec = 0
-        self.queued_exec = 0
         self.ops_served = 0
         self.tcp_generation = 0
+        self.exec_jobs = ExecJobManager(
+            max_concurrency=self.exec_limit,
+            initial_concurrency=1,
+            queue_limit=self.policy["exec_queue_limit"],
+            queue_timeout=self.policy["exec_queue_timeout"],
+            output_limit_bytes=self.policy["exec_output_limit_bytes"],
+            job_ttl=self.policy["exec_job_ttl"],
+            max_jobs=self.policy["exec_max_jobs"],
+            cancel_grace=EXEC_CANCEL_GRACE,
+            prepare_exec=self._prepare_exec,
+            process_factory=self._start_exec_process,
+            transport_failure_callback=self._mark_open,
+        )
         self.rsync = RsyncManager(
             profile,
             self.transport,
             remote_stat=self._rsync_remote_stat,
             remote_probe=self._rsync_remote_probe,
             on_transport_error=self._mark_open)
+        self._closed = False
 
     def snapshot(self):
+        exec_snapshot = self.exec_jobs.snapshot()
         with self.state_lock:
             result = {
                 "profile": self.profile.name,
@@ -76,18 +89,17 @@ class BrokerState:
                 "cooldown_until": self.cooldown_until,
                 "sftp_alive": (
                     self.session is not None and not self.session._closed),
-                "active_exec": self.active_exec,
-                "queued_exec": self.queued_exec,
                 "ops_served": self.ops_served,
                 "tcp_generation": self.tcp_generation,
                 "transport": (
                     "openssh-controlmaster"
                     if self.transport.multiplexing else "openssh-direct"),
                 "multiplexing": self.transport.multiplexing,
-                "exec_concurrency": self.exec_limit,
                 "degraded_reason": self.transport.degraded_reason,
                 "features": ["sftp", "exec", "rsync"],
+                "capabilities": ["exec_jobs_v1"],
             }
+        result.update(exec_snapshot)
         result.update(self.rsync.snapshot())
         return result
 
@@ -122,9 +134,6 @@ class BrokerState:
                     self.last_attempt_at = now
             try:
                 self.transport.start()
-                if not self.transport.multiplexing and self.exec_limit != 1:
-                    self.exec_limit = 1
-                    self.exec_semaphore = threading.BoundedSemaphore(1)
                 if not self.transport.multiplexing and manual:
                     self._probe_direct_connection()
             except BridgeError as error:
@@ -138,39 +147,61 @@ class BrokerState:
                 self.cooldown_until = 0
                 if self.transport.multiplexing:
                     self.tcp_generation += 1
+            self.exec_jobs.set_effective_concurrency(
+                self.exec_limit if self.transport.multiplexing else 1)
 
     def reconnect(self):
+        active_exec = self.exec_jobs.pause_dispatch()
+        if active_exec:
+            self.exec_jobs.resume_dispatch()
+            raise BridgeError(
+                "BROKER_BUSY",
+                "cannot reconnect while Exec jobs are running",
+                active_exec=active_exec)
         with self.connect_lock:
-            with self.state_lock:
-                if self.state in ("CONNECTING", "HALF_OPEN"):
-                    raise BridgeError(
-                        "CONNECTION_PAUSED",
-                        "another connection attempt is already in progress")
-                now = time.time()
-                not_before = (
-                    (self.last_attempt_at or 0)
-                    + self.policy["min_connect_interval"])
-                if now < not_before:
-                    raise BridgeError(
-                        "CONNECTION_RATE_LIMITED",
-                        "connection retry is rate limited for %.1fs"
-                        % (not_before - now),
-                        retry_after=max(0, not_before - now))
-                if self.state == "READY":
-                    self.state = "DISCONNECTED"
-                    self.cooldown_until = 0
-                    self.last_error = None
-            with self.sftp_lock:
-                self._drop_session_unlocked()
-            self.rsync.invalidate_capabilities()
-            self.transport.stop()
-            self.ensure_ready(manual=True)
+            try:
+                with self.state_lock:
+                    if self.state in ("CONNECTING", "HALF_OPEN"):
+                        raise BridgeError(
+                            "CONNECTION_PAUSED",
+                            "another connection attempt is already in progress")
+                    now = time.time()
+                    not_before = (
+                        (self.last_attempt_at or 0)
+                        + self.policy["min_connect_interval"])
+                    if now < not_before:
+                        raise BridgeError(
+                            "CONNECTION_RATE_LIMITED",
+                            "connection retry is rate limited for %.1fs"
+                            % (not_before - now),
+                            retry_after=max(0, not_before - now))
+                    if self.state == "READY":
+                        self.state = "DISCONNECTED"
+                        self.cooldown_until = 0
+                        self.last_error = None
+                with self.sftp_lock:
+                    self._drop_session_unlocked()
+                self.rsync.invalidate_capabilities()
+                self.transport.stop()
+                self.ensure_ready(manual=True)
+            except BridgeError as error:
+                with self.state_lock:
+                    opened = self.state == "OPEN"
+                if opened:
+                    self.exec_jobs.fail_queued(error)
+                self.exec_jobs.resume_dispatch(
+                    self.exec_limit if self.transport.multiplexing else 1)
+                raise
+            else:
+                self.exec_jobs.resume_dispatch(
+                    self.exec_limit if self.transport.multiplexing else 1)
         return self.snapshot()
 
     def run(self, op, arguments):
         if op not in {
                 "list_dir", "stat", "read_file", "write_file",
                 "mkdir", "move", "delete", "exec", "hash",
+                "exec_start", "exec_status", "exec_cancel",
                 "sync_start", "sync_status", "sync_cancel"}:
             raise BridgeError(
                 "INVALID_ARG", "unknown broker operation: %s" % op)
@@ -178,6 +209,25 @@ class BrokerState:
             self.ops_served += 1
         if op == "exec":
             return self._run_exec_op(arguments)
+        if op == "exec_start":
+            with self.state_lock:
+                if self.state == "OPEN":
+                    raise self._paused_error_locked()
+            request = ops.normalize_exec_request(
+                self.profile,
+                arguments.get("command"),
+                cwd=arguments.get("cwd", "/"),
+                timeout=arguments.get("timeout"),
+            )
+            return self.exec_jobs.start(request)
+        if op == "exec_status":
+            return self.exec_jobs.status(
+                arguments.get("job_id"),
+                cursor=arguments.get("cursor", 0),
+                max_bytes=arguments.get("max_bytes", 65536),
+            )
+        if op == "exec_cancel":
+            return self.exec_jobs.cancel(arguments.get("job_id"))
         if op == "sync_start":
             self.ensure_ready()
             return self.rsync.start(
@@ -274,42 +324,24 @@ class BrokerState:
             exec_runner=self._execute)
 
     def _execute(self, profile, command, cwd, timeout):
-        _ = profile
+        return self.exec_jobs.run_sync(
+            profile, command, cwd, timeout)
+
+    def _prepare_exec(self):
         self.ensure_ready()
-        acquired = self.exec_semaphore.acquire(blocking=False)
-        if not acquired:
+        if not self.transport.multiplexing:
+            self._begin_direct_connection()
+            return 1
+        return self.exec_limit
+
+    def _start_exec_process(self, command, cwd):
+        process = start_exec(
+            self.transport.channel_profile, command, cwd)
+        if not self.transport.multiplexing:
             with self.state_lock:
-                self.queued_exec += 1
-            try:
-                self.exec_semaphore.acquire()
-            finally:
-                with self.state_lock:
-                    self.queued_exec -= 1
-        with self.state_lock:
-            self.active_exec += 1
-        try:
-            if not self.transport.multiplexing:
-                self._begin_direct_connection()
-            result = run_exec(
-                self.transport.channel_profile, command, cwd, timeout,
-                connect_retries=0)
-            if not self.transport.multiplexing:
-                with self.state_lock:
-                    self.tcp_generation += 1
-                    self.last_connected_at = time.time()
-            if result["exit_code"] == 255 \
-                    and is_ssh_transport_failure(result["stderr"]):
-                error = BridgeError(
-                    "SSH_ERROR",
-                    "ssh connection failed before command execution: %s"
-                    % result["stderr"].strip()[:400])
-                self._mark_open(error)
-                raise error
-            return result
-        finally:
-            with self.state_lock:
-                self.active_exec -= 1
-            self.exec_semaphore.release()
+                self.tcp_generation += 1
+                self.last_connected_at = time.time()
+        return process
 
     def _rsync_remote_stat(self, path):
         return self._run_sftp_op("stat", {"path": path})
@@ -387,10 +419,18 @@ class BrokerState:
         self.session = None
 
     def close(self):
+        if self._closed:
+            return {
+                "canceled_exec_jobs": 0,
+                "remote_termination_unknown": False,
+            }
+        self._closed = True
         self.rsync.close()
+        summary = self.exec_jobs.close()
         with self.sftp_lock:
             self._drop_session_unlocked()
         self.transport.stop()
+        return summary
 
 
 class BrokerServer:
@@ -525,7 +565,8 @@ class BrokerServer:
             elif operation == "reconnect":
                 result = self.state.reconnect()
             elif operation == "shutdown":
-                result = {"stopped": True}
+                result = self.state.close()
+                result["stopped"] = True
                 self.shutdown_event.set()
             else:
                 result = self.state.run(operation, arguments)

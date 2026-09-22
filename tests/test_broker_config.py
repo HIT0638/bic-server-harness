@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -12,7 +13,8 @@ from unittest import mock
 from sshbridge import cli
 from sshbridge.broker import BrokerServer, BrokerState
 from sshbridge.broker_client import (
-    BrokerEndpoint, _broker_launch_argv, profile_fingerprint)
+    EXEC_JOBS_CAPABILITY, BrokerClient, BrokerEndpoint, _broker_launch_argv,
+    profile_fingerprint)
 from sshbridge.config import Profile
 from sshbridge.errors import BridgeError
 from sshbridge.exec_client import is_ssh_transport_failure
@@ -36,6 +38,12 @@ class TestConnectionPolicy(unittest.TestCase):
         profile = Profile("test", profile_raw())
         self.assertEqual(profile.connection_policy["mode"], "broker")
         self.assertEqual(profile.connection_policy["exec_concurrency"], 2)
+        self.assertEqual(profile.connection_policy["exec_queue_limit"], 8)
+        self.assertEqual(profile.connection_policy["exec_queue_timeout"], 60)
+        self.assertEqual(
+            profile.connection_policy["exec_output_limit_bytes"], 4194304)
+        self.assertEqual(profile.connection_policy["exec_job_ttl"], 600)
+        self.assertEqual(profile.connection_policy["exec_max_jobs"], 32)
         self.assertEqual(profile.connection_policy["connect_retries"], 0)
         self.assertTrue(profile.connection_policy["control_master"])
         self.assertEqual(profile.rsync_bin, "rsync")
@@ -61,6 +69,21 @@ class TestConnectionPolicy(unittest.TestCase):
             {"exec_concurrency": 0},
             {"exec_concurrency": 4},
             {"exec_concurrency": True},
+            {"exec_queue_limit": -1},
+            {"exec_queue_limit": 65},
+            {"exec_queue_limit": True},
+            {"exec_queue_timeout": 0},
+            {"exec_queue_timeout": 86401},
+            {"exec_queue_timeout": True},
+            {"exec_output_limit_bytes": 65535},
+            {"exec_output_limit_bytes": 67108865},
+            {"exec_output_limit_bytes": True},
+            {"exec_job_ttl": 0},
+            {"exec_job_ttl": 86401},
+            {"exec_job_ttl": False},
+            {"exec_max_jobs": 9},
+            {"exec_max_jobs": 257},
+            {"exec_max_jobs": True},
             {"min_connect_interval": -1},
             {"connect_retries": 1},
             {"connect_retries": False},
@@ -155,6 +178,25 @@ class TestBrokerEndpoint(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     BrokerEndpoint("/tmp/bridge.json", profile)
             self.assertEqual(caught.exception.code, "BROKER_UNAVAILABLE")
+
+
+class TestBrokerCapabilities(unittest.TestCase):
+    def test_requires_capability_from_live_broker_status(self):
+        client = object.__new__(BrokerClient)
+        client.ping = mock.Mock(return_value={
+            "capabilities": [EXEC_JOBS_CAPABILITY],
+        })
+        result = client.require_capability(EXEC_JOBS_CAPABILITY)
+        self.assertIn(EXEC_JOBS_CAPABILITY, result["capabilities"])
+
+    def test_missing_capability_requires_explicit_broker_restart(self):
+        client = object.__new__(BrokerClient)
+        client.ping = mock.Mock(return_value={"capabilities": []})
+        with self.assertRaises(BridgeError) as caught:
+            client.require_capability(EXEC_JOBS_CAPABILITY)
+        self.assertEqual(
+            caught.exception.code, "BROKER_RESTART_REQUIRED")
+        self.assertIn(EXEC_JOBS_CAPABILITY, caught.exception.message)
 
 
 class TestBrokerLauncher(unittest.TestCase):
@@ -264,6 +306,9 @@ class TestBrokerProtocol(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["request_id"], "request-one")
         self.assertEqual(response["instance_id"], server.instance_id)
+        self.assertIn(
+            EXEC_JOBS_CAPABILITY,
+            response["result"]["capabilities"])
 
     def test_profile_mismatch_is_rejected(self):
         response, _ = self.exchange({
@@ -398,6 +443,8 @@ class TestBrokerSyncRouting(unittest.TestCase):
         snapshot = self.state.snapshot()
         self.assertEqual(
             snapshot["features"], ["sftp", "exec", "rsync"])
+        self.assertEqual(
+            snapshot["capabilities"], [EXEC_JOBS_CAPABILITY])
         self.assertEqual(snapshot["sync_active"], 1)
         self.assertEqual(snapshot["sync_queued"], 2)
         self.assertEqual(snapshot["sync_history"], 3)
@@ -466,18 +513,19 @@ class TestBrokerSyncRouting(unittest.TestCase):
                 "rsync version 3.2.7\n"
                 "  -s, --secluded-args\n"),
             stderr="")
-        exec_result = {
-            "command": "true",
-            "cwd": self.profile.root,
-            "stdout": (
-                "rsync version 3.2.7\n"
-                "  -s, --secluded-args\n"),
-            "stderr": "",
-            "exit_code": 0,
-            "timed_out": False,
-            "remote_may_still_be_running": False,
-        }
         session = SimpleNamespace(_closed=False)
+
+        def exec_process(_command, _cwd):
+            return subprocess.Popen(
+                [
+                    "/bin/sh", "-c",
+                    "printf 'rsync version 3.2.7\\n"
+                    "  -s, --secluded-args\\n'",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
 
         def dispatch_sftp(operation, arguments, active_session):
             _ = active_session
@@ -494,6 +542,7 @@ class TestBrokerSyncRouting(unittest.TestCase):
         self.state.state = "READY"
         self.state._session_unlocked = mock.Mock(return_value=session)
         self.state._dispatch_sftp = mock.Mock(side_effect=dispatch_sftp)
+        self.state.exec_jobs.process_factory = exec_process
         self.state.rsync = RsyncManager(
             self.profile,
             self.state.transport,
@@ -504,24 +553,21 @@ class TestBrokerSyncRouting(unittest.TestCase):
             terminate_process=lambda active: active.finish(-15))
 
         with tempfile.NamedTemporaryFile() as source:
-            with mock.patch(
-                    "sshbridge.broker.run_exec",
-                    return_value=exec_result):
-                started = self.state.run("sync_start", {
-                    "direction": "push",
-                    "sources": [source.name],
-                    "destination": "/",
-                })
-                self.assertTrue(spawned.wait(1))
-                self.assertEqual(
-                    self.state.rsync.status(started["job_id"])["state"],
-                    "running")
-                self.assertEqual(
-                    self.state.run("list_dir", {"path": "/"})["op"],
-                    "list_dir")
-                self.assertEqual(
-                    self.state.run("exec", {"command": "true"})["exit_code"],
-                    0)
+            started = self.state.run("sync_start", {
+                "direction": "push",
+                "sources": [source.name],
+                "destination": "/",
+            })
+            self.assertTrue(spawned.wait(1))
+            self.assertEqual(
+                self.state.rsync.status(started["job_id"])["state"],
+                "running")
+            self.assertEqual(
+                self.state.run("list_dir", {"path": "/"})["op"],
+                "list_dir")
+            self.assertEqual(
+                self.state.run("exec", {"command": "true"})["exit_code"],
+                0)
 
         process.finish()
         for _ in range(100):

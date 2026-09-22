@@ -14,6 +14,7 @@ from .errors import BridgeError
 
 PROTOCOL_VERSION = 1
 MAX_MESSAGE = 256 * 1024 * 1024
+EXEC_JOBS_CAPABILITY = "exec_jobs_v1"
 _UNIX_PATH_LIMIT = 103
 
 
@@ -238,6 +239,16 @@ class BrokerClient:
 
     def ping(self):
         return self.request("ping", timeout=2.0)
+
+    def require_capability(self, name):
+        status = self.ping()
+        if name not in status.get("capabilities", []):
+            raise BridgeError(
+                "BROKER_RESTART_REQUIRED",
+                "restart the profile broker to enable %s" % name,
+                capability=name,
+            )
+        return status
 
     def ensure_started(self, timeout=10.0):
         try:

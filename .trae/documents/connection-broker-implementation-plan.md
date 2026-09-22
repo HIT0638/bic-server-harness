@@ -14,6 +14,22 @@ broker 自动启动；broker 不可用时不回退直连。首次连接失败后
 本期不实现 MCP、Rsync、Windows named pipe、异步命令任务和严格 Exec 沙箱，但会
 为这些能力保留稳定边界。
 
+### 目标架构
+
+```mermaid
+flowchart LR
+    CLI --> Client["BrokerClient"]
+    Web --> Client
+    Desktop --> Client
+    MCP --> Client
+    Client -->|"Unix socket"| Broker
+    Broker --> SFTP["单 SFTP channel"]
+    Broker --> Exec["Exec semaphore"]
+    SFTP --> Master["OpenSSH ControlMaster"]
+    Exec --> Master
+    Master --> Remote["远端 sshd"]
+```
+
 ## Current State Analysis
 
 ### Repository State

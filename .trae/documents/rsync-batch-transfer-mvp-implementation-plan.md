@@ -32,7 +32,7 @@ SFTP channel。
 - `sshbridge/broker.py::BrokerState` 已将资源锁分开：
   - `connect_lock` 管理连接状态。
   - `sftp_lock` 串行化单一 SFTP session。
-  - `exec_semaphore` 限制独立 Exec channel。
+  - `ExecJobManager` 限制同步与异步 Exec channel。
 - `sshbridge/ops.py` 已实现所有远端文件操作的 `REALPATH` 与 canonical root 校验。
 - Broker 请求和结果均为 JSON-ready dict，稳定错误通过 `BridgeError` 返回。
 - 集成测试已经验证 Exec 与 SFTP 可通过同一 ControlMaster TCP 并行。
@@ -388,8 +388,8 @@ Broker 行为：
 
 - `sync_start` 先调用 `ensure_ready()`。
 - `sync_start` 的 SFTP canonical 检查在 `sftp_lock` 内完成，随后释放锁再排队。
-- 任务执行期间不持有 `sftp_lock`、`exec_semaphore` 或 `connect_lock`。
-- capability probe 使用短 Exec channel，可短暂占用 `exec_semaphore`。
+- 任务执行期间不持有 `sftp_lock`、Exec 调度容量或 `connect_lock`。
+- capability probe 使用短 Exec channel，可短暂占用 `ExecJobManager` 调度容量。
 - 异步 Rsync stderr 被识别为 SSH transport failure 时，通过回调进入现有
   `OPEN` 熔断状态，不自动重连。
 - `snapshot()` 增加 `sync_active`、`sync_queued`、`sync_history` 和

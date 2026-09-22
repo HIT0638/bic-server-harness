@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import hashlib
 import json
 import os
@@ -16,6 +17,14 @@ from sshbridge.broker_client import BrokerClient
 from sshbridge.config import Profile
 from sshbridge.errors import BridgeError
 from sshbridge.sftp_client import SftpSession
+
+try:
+    from mcp import Client, StdioServerParameters
+    MCP_AVAILABLE = True
+except ImportError:
+    Client = None
+    StdioServerParameters = None
+    MCP_AVAILABLE = False
 
 try:
     from tests.local_sshd import LocalSshd, LocalSshdUnavailable
@@ -62,6 +71,20 @@ class TestLocalSshdIntegration(unittest.TestCase):
         with self.assertRaises(BridgeError) as caught:
             function(*args, **kwargs)
         self.assertEqual(caught.exception.code, code)
+
+    def wait_for_job(self, client, job_id, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        latest = None
+        while time.monotonic() < deadline:
+            latest = client.request("exec_status", {
+                "job_id": job_id,
+                "cursor": 0,
+                "max_bytes": 65536,
+            })
+            if predicate(latest):
+                return latest
+            time.sleep(0.02)
+        self.fail("job condition not reached; latest=%r" % latest)
 
     def test_filesystem_workflow_and_conflicts(self):
         nested = self.remote_case + "/nested"
@@ -321,6 +344,158 @@ class TestLocalSshdIntegration(unittest.TestCase):
             else:
                 os.environ["SSHBRIDGE_STATE_DIR"] = previous
 
+    def test_async_exec_incremental_queue_cancel_timeout_and_cli(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        client = BrokerClient(str(self.server.config_path), self.profile)
+        try:
+            client.ensure_started()
+            started_at = time.monotonic()
+            started = client.request("exec_start", {
+                "command": "printf first; sleep 0.3; printf second",
+                "cwd": self.remote_case,
+                "timeout": 3,
+            })
+            self.assertLess(time.monotonic() - started_at, 0.25)
+            first = self.wait_for_job(
+                client, started["job_id"],
+                lambda status: any(
+                    event["text"] == "first"
+                    for event in status["events"]))
+            self.assertEqual(first["state"], "RUNNING")
+            final = self.wait_for_job(
+                client, started["job_id"],
+                lambda status: status["state"] == "EXITED")
+            self.assertEqual(final["exit_code"], 0)
+            tail = client.request("exec_status", {
+                "job_id": started["job_id"],
+                "cursor": first["next_cursor"],
+                "max_bytes": 65536,
+            })
+            self.assertEqual(
+                "".join(event["text"] for event in tail["events"]),
+                "second")
+
+            running = [
+                client.request("exec_start", {
+                    "command": "sleep 5",
+                    "cwd": self.remote_case,
+                    "timeout": 10,
+                })
+                for _ in range(2)
+            ]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                snapshot = client.status()
+                if snapshot["active_exec"] == 2:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(client.status()["active_exec"], 2)
+            with self.assertRaises(BridgeError) as busy:
+                client.reconnect()
+            self.assertEqual(busy.exception.code, "BROKER_BUSY")
+
+            marker = self.local_case / "queued-marker"
+            queued = client.request("exec_start", {
+                "command": "printf created > queued-marker",
+                "cwd": self.remote_case,
+                "timeout": 3,
+            })
+            self.assertEqual(
+                client.request("exec_status", {
+                    "job_id": queued["job_id"],
+                })["state"],
+                "QUEUED")
+            queued_cancel = client.request(
+                "exec_cancel", {"job_id": queued["job_id"]})
+            self.assertEqual(queued_cancel["state"], "CANCELED")
+            self.assertFalse(
+                queued_cancel["remote_termination_unknown"])
+
+            for job in running:
+                canceled = client.request(
+                    "exec_cancel", {"job_id": job["job_id"]})
+                self.assertEqual(canceled["state"], "CANCELED")
+                self.assertTrue(
+                    canceled["remote_termination_unknown"])
+            time.sleep(0.1)
+            self.assertFalse(marker.exists())
+            self.assertEqual(
+                client.request("list_dir", {"path": "/"})["op"],
+                "list_dir")
+
+            timed = client.request("exec_start", {
+                "command": "printf before; sleep 5",
+                "cwd": self.remote_case,
+                "timeout": 0.1,
+            })
+            timed_status = self.wait_for_job(
+                client, timed["job_id"],
+                lambda status: status["state"] == "TIMED_OUT")
+            self.assertTrue(
+                timed_status["remote_termination_unknown"])
+            self.assertIn(
+                "before",
+                "".join(event["text"]
+                        for event in timed_status["events"]))
+
+            cli_start = self.run_cli(
+                "--json", "exec-start", "--cwd", self.remote_case,
+                "--", "printf", "cli-async", env=os.environ.copy())
+            self.assertEqual(cli_start.returncode, 0, cli_start.stderr)
+            cli_job_id = json.loads(cli_start.stdout)["job_id"]
+            deadline = time.monotonic() + 3
+            cli_status = None
+            while time.monotonic() < deadline:
+                completed = self.run_cli(
+                    "--json", "exec-status", cli_job_id,
+                    env=os.environ.copy())
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                cli_status = json.loads(completed.stdout)
+                if cli_status["state"] == "EXITED":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(cli_status["state"], "EXITED")
+            self.assertEqual(
+                "".join(event["text"]
+                        for event in cli_status["events"]),
+                "cli-async")
+            self.assertEqual(client.status()["tcp_generation"], 1)
+        finally:
+            client.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    def test_broker_shutdown_cancels_running_exec_job(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        client = BrokerClient(str(self.server.config_path), self.profile)
+        stopped = False
+        try:
+            client.ensure_started()
+            started = client.request("exec_start", {
+                "command": "sleep 5",
+                "cwd": self.remote_case,
+                "timeout": 10,
+            })
+            self.wait_for_job(
+                client, started["job_id"],
+                lambda status: status["state"] == "RUNNING")
+            result = client.stop()
+            stopped = True
+            self.assertTrue(result["stopped"])
+            self.assertEqual(result["canceled_exec_jobs"], 1)
+            self.assertTrue(result["remote_termination_unknown"])
+        finally:
+            if not stopped:
+                client.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
     def test_broker_pauses_after_master_exit_until_reconnect(self):
         previous = os.environ.get("SSHBRIDGE_STATE_DIR")
         os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
@@ -460,6 +635,275 @@ class TestLocalSshdIntegration(unittest.TestCase):
                 os.environ.pop("SSHBRIDGE_STATE_DIR", None)
             else:
                 os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    @unittest.skipUnless(MCP_AVAILABLE, "MCP Python SDK is not installed")
+    def test_mcp_stdio_workflow_and_shared_broker(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        broker = BrokerClient(str(self.server.config_path), self.profile)
+
+        async def workflow():
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-m", "sshbridge.mcp_server",
+                    "--config", str(self.server.config_path),
+                    "--profile", "local-test",
+                ],
+                env={
+                    "SSHBRIDGE_STATE_DIR": str(self.server.daemon_state),
+                },
+                cwd=str(PROJECT_ROOT),
+            )
+            directory = self.remote_case + "/mcp"
+            text_path = directory + "/note.txt"
+            moved_path = directory + "/moved.txt"
+            binary_path = directory + "/binary.bin"
+
+            async with Client(parameters) as first:
+                tools = await first.list_tools()
+                self.assertEqual(len(tools.tools), 14)
+
+                reconnected = await first.call_tool("reconnect", {})
+                self.assertFalse(reconnected.is_error)
+                self.assertEqual(
+                    reconnected.structured_content["result"][
+                        "tcp_generation"],
+                    1)
+
+                made = await first.call_tool(
+                    "mkdir", {"path": directory})
+                self.assertFalse(made.is_error)
+                written = await first.call_tool(
+                    "write_file",
+                    {"path": text_path, "content": "mcp text\n"})
+                self.assertEqual(
+                    written.structured_content["result"]["bytes_written"],
+                    9)
+
+                listed = await first.call_tool(
+                    "list_dir", {"path": directory})
+                self.assertEqual(
+                    [entry["name"] for entry in
+                     listed.structured_content["result"]["entries"]],
+                    ["note.txt"])
+
+                metadata = await first.call_tool(
+                    "stat", {"path": text_path})
+                self.assertEqual(
+                    metadata.structured_content["result"]["type"], "file")
+                self.assertNotIn(
+                    "real_path", metadata.structured_content["result"])
+
+                read = await first.call_tool(
+                    "read_file", {"path": text_path})
+                self.assertEqual(
+                    read.structured_content["result"]["content"],
+                    "mcp text\n")
+                digest = await first.call_tool(
+                    "hash_file", {"path": text_path})
+                self.assertEqual(
+                    digest.structured_content["result"]["hash"],
+                    hashlib.sha256(b"mcp text\n").hexdigest())
+
+                moved = await first.call_tool(
+                    "move", {"src": text_path, "dst": moved_path})
+                self.assertFalse(moved.is_error)
+
+                (self.local_case / "mcp" / "binary.bin").write_bytes(
+                    b"\x00\xffmcp")
+                binary = await first.call_tool(
+                    "read_file",
+                    {"path": binary_path, "encoding": "base64"})
+                self.assertEqual(
+                    base64.b64decode(
+                        binary.structured_content["result"]["content_b64"]),
+                    b"\x00\xffmcp")
+
+                executed = await first.call_tool(
+                    "exec",
+                    {
+                        "command": "printf mcp-ok",
+                        "cwd": directory,
+                        "timeout": 2,
+                    })
+                self.assertEqual(
+                    executed.structured_content["result"]["stdout"],
+                    "mcp-ok")
+                self.assertNotIn(
+                    "real_cwd", executed.structured_content["result"])
+
+                async_started = await first.call_tool(
+                    "exec_start",
+                    {
+                        "command": "printf mcp-first; sleep 0.2; "
+                                   "printf mcp-second",
+                        "cwd": directory,
+                        "timeout": 2,
+                    })
+                self.assertFalse(async_started.is_error)
+                async_job_id = (
+                    async_started.structured_content["result"]["job_id"])
+                first_page = None
+                for _ in range(100):
+                    first_page = await first.call_tool(
+                        "exec_status",
+                        {"job_id": async_job_id})
+                    if any(
+                            event["text"] == "mcp-first"
+                            for event in first_page.structured_content[
+                                "result"]["events"]):
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertEqual(
+                    first_page.structured_content["result"]["state"],
+                    "RUNNING")
+                cursor = first_page.structured_content[
+                    "result"]["next_cursor"]
+
+                conflict = await first.call_tool(
+                    "write_file",
+                    {
+                        "path": moved_path,
+                        "content": "bad",
+                        "expected_size": 999,
+                    })
+                self.assertEqual(
+                    self.mcp_error_code(conflict), "CONFLICT")
+                not_empty = await first.call_tool(
+                    "delete", {"path": directory})
+                self.assertEqual(
+                    self.mcp_error_code(not_empty), "NOT_EMPTY")
+
+                status = await first.call_tool(
+                    "connection_status", {})
+                self.assertEqual(
+                    status.structured_content["result"]["tcp_generation"],
+                    1)
+                async with Client(parameters) as second:
+                    second_status = await second.call_tool(
+                        "connection_status", {})
+                    self.assertEqual(
+                        second_status.structured_content["result"][
+                            "tcp_generation"],
+                        1)
+                    async_status = None
+                    for _ in range(100):
+                        async_status = await second.call_tool(
+                            "exec_status",
+                            {
+                                "job_id": async_job_id,
+                                "cursor": cursor,
+                            })
+                        if async_status.structured_content[
+                                "result"]["state"] == "EXITED":
+                            break
+                        await asyncio.sleep(0.02)
+                    self.assertFalse(async_status.is_error)
+                    self.assertEqual(
+                        "".join(
+                            event["text"] for event in
+                            async_status.structured_content[
+                                "result"]["events"]),
+                        "mcp-second")
+
+                for path in (moved_path, binary_path, directory):
+                    deleted = await first.call_tool(
+                        "delete", {"path": path})
+                    self.assertFalse(deleted.is_error)
+
+        try:
+            asyncio.run(workflow())
+            self.assertTrue(broker.status()["running"])
+            self.assertEqual(broker.status()["tcp_generation"], 1)
+            quiet = subprocess.run(
+                [
+                    sys.executable, "-m", "sshbridge.mcp_server",
+                    "--config", str(self.server.config_path),
+                    "--profile", "local-test",
+                ],
+                cwd=PROJECT_ROOT, env=os.environ.copy(),
+                input="", capture_output=True, text=True, timeout=20)
+            self.assertEqual(quiet.returncode, 0, quiet.stderr)
+            self.assertEqual(quiet.stdout, "")
+            listed = self.run_cli(
+                "--json", "ls", "/", env=os.environ.copy())
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            self.assertEqual(broker.status()["tcp_generation"], 1)
+        finally:
+            broker.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    @unittest.skipUnless(MCP_AVAILABLE, "MCP Python SDK is not installed")
+    def test_mcp_reconnect_recovers_paused_broker(self):
+        previous = os.environ.get("SSHBRIDGE_STATE_DIR")
+        os.environ["SSHBRIDGE_STATE_DIR"] = str(self.server.daemon_state)
+        broker = BrokerClient(str(self.server.config_path), self.profile)
+
+        async def workflow():
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-m", "sshbridge.mcp_server",
+                    "--config", str(self.server.config_path),
+                    "--profile", "local-test",
+                ],
+                env={
+                    "SSHBRIDGE_STATE_DIR": str(self.server.daemon_state),
+                },
+                cwd=str(PROJECT_ROOT),
+            )
+            async with Client(parameters) as client:
+                listed = await client.call_tool("list_dir", {"path": "/"})
+                self.assertFalse(listed.is_error)
+                self.assertEqual(broker.status()["tcp_generation"], 1)
+
+                subprocess.run(
+                    self.profile.control_argv(
+                        broker.endpoint.control_path, "exit"),
+                    capture_output=True, timeout=5)
+                deadline = time.monotonic() + 2
+                while os.path.exists(broker.endpoint.control_path) \
+                        and time.monotonic() < deadline:
+                    await asyncio.sleep(0.02)
+
+                paused = await client.call_tool(
+                    "list_dir", {"path": "/"})
+                self.assertEqual(
+                    self.mcp_error_code(paused), "CONNECTION_PAUSED")
+                await asyncio.sleep(0.06)
+                reconnected = await client.call_tool("reconnect", {})
+                self.assertFalse(reconnected.is_error)
+                self.assertEqual(
+                    reconnected.structured_content["result"][
+                        "tcp_generation"],
+                    2)
+                recovered = await client.call_tool(
+                    "list_dir", {"path": "/"})
+                self.assertFalse(recovered.is_error)
+
+        try:
+            asyncio.run(workflow())
+        finally:
+            broker.stop()
+            if previous is None:
+                os.environ.pop("SSHBRIDGE_STATE_DIR", None)
+            else:
+                os.environ["SSHBRIDGE_STATE_DIR"] = previous
+
+    @staticmethod
+    def mcp_error_code(result):
+        text = "\n".join(
+            item.text for item in result.content
+            if getattr(item, "type", None) == "text")
+        start = text.find("{")
+        if start < 0:
+            raise AssertionError(
+                "MCP error did not contain JSON: %r" % text)
+        return json.loads(text[start:])["error"]["code"]
 
     def run_cli(self, *arguments, env=None):
         return subprocess.run(

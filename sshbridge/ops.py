@@ -352,6 +352,23 @@ def op_delete(profile, path, session=None):
     }
 
 
+def normalize_exec_request(profile, command, cwd="/", timeout=None):
+    """Validate and map one Exec request without performing remote I/O."""
+    command = (command or "").strip()
+    if not command:
+        raise BridgeError("INVALID_ARG", "empty command")
+    timeout = profile.exec_timeout if timeout is None else timeout
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
+            or timeout <= 0:
+        raise BridgeError("INVALID_ARG", "timeout must be > 0")
+    return {
+        "command": command,
+        "cwd": cwd,
+        "real_cwd": resolve_virtual(cwd, profile.root),
+        "timeout": timeout,
+    }
+
+
 def op_exec(profile, command, cwd="/", timeout=None, exec_runner=None):
     """Run a shell command remotely.
 
@@ -360,25 +377,22 @@ def op_exec(profile, command, cwd="/", timeout=None, exec_runner=None):
     validating it; a bad cwd fails naturally via `cd` in the structured
     stderr. File operations keep the strict REALPATH-based sandbox.
     """
-    command = (command or "").strip()
-    if not command:
-        raise BridgeError("INVALID_ARG", "empty command")
-    timeout = profile.exec_timeout if timeout is None else timeout
-    if not isinstance(timeout, (int, float)) or timeout <= 0:
-        raise BridgeError("INVALID_ARG", "timeout must be > 0")
-    cwd_real = resolve_virtual(cwd, profile.root)
+    request = normalize_exec_request(profile, command, cwd, timeout)
     runner = exec_runner or run_exec
-    res = runner(profile, command, cwd_real, timeout)
+    res = runner(
+        profile, request["command"], request["real_cwd"], request["timeout"])
     out = {
         "op": "exec",
-        "cwd": cwd,
-        "real_cwd": cwd_real,
-        "timeout": timeout,
+        "cwd": request["cwd"],
+        "real_cwd": request["real_cwd"],
+        "timeout": request["timeout"],
         "exit_code": res["exit_code"],
         "stdout": res["stdout"],
         "stderr": res["stderr"],
         "timed_out": res["timed_out"],
     }
+    if "output_truncated" in res:
+        out["output_truncated"] = bool(res["output_truncated"])
     if res["timed_out"]:
         out["note"] = ("local ssh was killed on timeout; "
                        "the remote process may still be running")

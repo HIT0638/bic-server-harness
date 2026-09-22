@@ -37,8 +37,8 @@ sync cancel JOB_ID
 ```
 
 远端源和目标先通过现有 SFTP `stat`/`REALPATH` 根目录检查。能力探测和路径检查结束后
-释放 Exec semaphore 与 `sftp_lock`，实际 Rsync 进程不占用这些资源。remote shell
-由 profile 参数和 Broker ControlPath 构造，其中强制选项放在 profile `ssh_args`
+释放 Exec 调度容量与 `sftp_lock`，实际 Rsync 进程不占用这些资源。remote shell 由
+profile 参数和 Broker ControlPath 构造，其中强制选项放在 profile `ssh_args`
 之后，避免调用方覆盖：
 
 ```python
@@ -160,8 +160,10 @@ sync_cancel(job_id)
   且一次 Broker 生命周期内 `tcp_generation` 保持为 1。
 - 实传期间的 `lsof` 验证显示传输前和传输中均只有 1 条客户端 SSH TCP；取消后的
   job 为 `cancelled` 且 `remote_termination_unknown=true`。
-- Python 3.9 与 3.12 均通过 108 项全量测试和编译检查；arm64 macOS App 构建及
-  `codesign --verify --deep --strict` 通过，bundle 包含 `sshbridge/rsync.py`。
+- 合并异步 Exec 与 MCP 后，Python 3.9 发现 143 项测试并通过其中 134 项，9 项
+  MCP SDK 用例按版本约束跳过；Python 3.12 的 143 项全部通过。两套编译检查通过。
+- 合并后的 arm64 macOS App 构建及 `codesign --verify --deep --strict` 通过，
+  bundle 同时包含 `sshbridge/rsync.py` 和 `sshbridge/exec_jobs.py`。
 
 ## 已知限制
 
