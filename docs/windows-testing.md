@@ -67,3 +67,32 @@ GitHub Windows runner 本身也使用禁止 breakaway 的 Job Object。测试明
 3. 发布前在目标 Windows 10/11 与实际 MCP Host 验证安装和启动。
 
 不能以修改平台标识或 mock Windows API 代替以上真实平台验证。
+
+
+## Windows 到 Ubuntu SSH 集成测试
+
+同一 workflow 的 `windows-linux` job 在 Windows Server 2022 上导入一个临时
+Ubuntu 22.04 WSL1 实例。MCP Server、Broker、Python 与 `ssh.exe` 均为原生 Windows
+进程；测试端使用 Ubuntu 的真实 sshd、SFTP 和 shell，不用模拟 SSH 响应。
+
+WSL1 运行 Linux 用户态但不提供独立 Linux 内核。此结果不能替代独立 Linux 主机、
+真实网络故障、旧版 glibc 2.17 或目标 Windows 10/11 桌面验收。
+
+环境只在 GitHub 托管 runner 上创建：从 Ubuntu 官方地址下载 rootfs 并校验其
+SHA-256 清单；安装测试端标准 OpenSSH；新建专用普通用户。只监听随机 localhost
+端口，使用一次性 host/client key 和预置 known_hosts，禁止密码和 root 登录。
+测试先将 `only4test/` 复制到临时 Linux 工作区；不修改原始夹具，也不读取用户 SSH
+配置或仓库 `bridge.json`。CI `always()` 清理步骤注销本次生成的唯一 WSL 实例。
+
+三个端到端场景覆盖：
+
+- 中文及空格路径、读写、hash、mtime/size/hash 冲突、移动、删除、二进制读取、
+  分页、符号链接越界、多 MCP 客户端共享同一 Broker/SFTP 连接。
+- 同步 stdout/stderr/退出码、异步 cursor、排队取消、运行中取消、超时，以及运行
+  命令期间仍可写文件。取消仅断言本地 channel 已结束，不断言远端进程终止。
+- 关闭测试 sshd 和已有用户会话后进入 OPEN；恢复服务后业务请求仍拒绝连接，
+  必须显式 reconnect 才能重新读到原文件。
+
+环境创建失败、依赖错误、测试失败或跳过都不能算通过。Artifacts 仅上传测试日志、
+计数和目标镜像公开信息，不上传密钥、配置、WSL 文件系统或 Broker 运行目录。
+该 job 上限 25 分钟，不需要仓库 secrets，也不连接生产服务器。

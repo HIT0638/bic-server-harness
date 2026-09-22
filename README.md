@@ -430,7 +430,8 @@ config alias。raw IPv6 应先配置 SSH alias。
 
 ## 测试
 
-Windows 云端适配基线与本机复现步骤见 [Windows 自动测试](docs/windows-testing.md)。
+Windows 云端适配基线、原生 Windows 到临时 Ubuntu WSL1 SSH 的集成测试与
+本机复现步骤见 [Windows 自动测试](docs/windows-testing.md)。
 该基线覆盖 Windows Broker 本地链路，不代表远端 Linux 工作流或桌面 MCP Host 已完成验收。
 
 ```sh

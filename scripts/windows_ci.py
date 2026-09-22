@@ -28,6 +28,8 @@ TEST_MODULES = (
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--require-windows", action="store_true")
+    parser.add_argument("--linux-integration", action="store_true",
+                        help="require and test the disposable Ubuntu WSL SSH target")
     parser.add_argument("--output", type=Path, default=ROOT / ".test-runtime/windows-ci")
     args = parser.parse_args(argv)
     output = args.output.resolve()
@@ -52,6 +54,16 @@ def main(argv=None):
     else:
         report["not_verified"].append("Native Windows IPC and MCP/Broker integration (not run on this platform)")
     errors = []
+    if args.linux_integration:
+        report["suite"] = ["tests.test_windows_linux_mcp"]
+        report["integration_target"] = "Ubuntu 22.04 userspace under WSL1; native Windows client"
+        report["not_verified"] = [
+            "Independent Linux kernel/network and legacy glibc 2.17 servers",
+            "Windows 10/11 interactive MCP Host installation",
+            "Rsync and Desktop packaging",
+        ]
+        if os.name != "nt" or not os.environ.get("SSHBRIDGE_WSL_DISTRO"):
+            errors.append("Linux integration requires an explicitly provisioned Windows/WSL target.")
     if args.require_windows and os.name != "nt":
         errors.append("This CI job requires native Windows.")
     ssh = report["ssh_executable"]
@@ -103,8 +115,9 @@ def main(argv=None):
         "", "Platform: %s; Python %s." % (report["platform"], report["python"]),
         "", "This is a compatibility baseline, **not Windows product readiness**.",
         "Tests cover SDK contracts and native process jobs; native Windows also runs named pipe and MCP stdio/Broker tests.",
-        "Remote SSH operations are not verified by this baseline.",
-        "No user SSH configuration, real profile, remote host or credentials are used.",
+        ("Integration uses real Ubuntu sshd/SFTP/shell under WSL1; this does not validate an independent Linux kernel or legacy servers."
+         if args.linux_integration else "Remote SSH operations are not verified by this baseline."),
+        "Only isolated test profiles and generated keys are used; no user SSH configuration or existing server is accessed.",
         "", "## Not yet verified", "",
     ]
     summary.extend("- " + item for item in report["not_verified"])

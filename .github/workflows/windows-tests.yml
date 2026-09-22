@@ -54,3 +54,47 @@ jobs:
           path: .test-runtime/windows-ci/
           if-no-files-found: warn
           retention-days: 7
+
+  windows-linux:
+    name: Windows 2022 / Ubuntu WSL1 SSH integration
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      PYTHONUTF8: '1'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install MCP test dependencies
+        run: python -m pip install -r requirements-mcp.txt
+      - name: Provision isolated Ubuntu SSH target
+        shell: pwsh
+        run: ./scripts/windows_linux_target.ps1 -Action Start
+      - name: Exercise real Windows MCP to Ubuntu SSH
+        run: python scripts/windows_ci.py --require-windows --linux-integration --output .test-runtime/windows-linux
+      - name: Remove isolated Ubuntu target
+        if: always()
+        shell: pwsh
+        run: ./scripts/windows_linux_target.ps1 -Action Stop
+      - name: Publish integration scope and result
+        if: always()
+        shell: pwsh
+        run: |
+          $report = '.test-runtime/windows-linux/summary.md'
+          if (Test-Path $report) {
+            Get-Content $report | Add-Content $env:GITHUB_STEP_SUMMARY
+          } else {
+            'Windows/Ubuntu integration did not finish setup. No integration pass is claimed.' | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+      - name: Upload integration results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ubuntu-integration
+          path: .test-runtime/windows-linux/
+          if-no-files-found: warn
+          retention-days: 7
