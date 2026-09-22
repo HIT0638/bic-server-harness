@@ -23,6 +23,7 @@ Node.js、新版 glibc 或 Agent Runtime。
   OpenSSH 连接复用。
 - 默认通过本地 Connection Broker 复用一个 SSH TCP 和一个 SFTP channel。
 - ControlMaster 可用时允许两个 Exec channel 并行，且不阻塞 SFTP 文件操作。
+- 可选 Rsync 通道提供异步 push、pull、status 和 cancel，批量传输不占用 SFTP 锁。
 - 首次连接失败后进入熔断状态，只接受显式重连，不自动形成连接风暴。
 - 本地 Web Explorer 提供懒加载目录树、文本查看与编辑、新建和重命名。
 - macOS Desktop 使用 Cocoa 窗口承载同一套 Explorer，并继续复用 loopback API 与
@@ -34,6 +35,7 @@ Node.js、新版 glibc 或 Agent Runtime。
 - 本地可执行 `ssh` 的 OpenSSH 客户端。
 - 远端 `sshd` 已启用 SFTP 子系统。
 - 仅使用 `hash` 或 `write --expected-hash` 时，远端需要 `sha256sum`。
+- 仅使用 `sync` 时，本地与远端需要支持 protected args 的兼容 Rsync。
 
 CLI、Broker 和 Web Explorer 无需第三方 Python 依赖。macOS Desktop 的可选依赖
 单独锁定在 `requirements-desktop-macos.txt`。
@@ -58,6 +60,8 @@ cp bridge.example.json bridge.json
       "port": 22,
       "user": "remote-user",
       "root": "/home/remote-user/project",
+      "rsync_bin": "rsync",
+      "remote_rsync_bin": "rsync",
       "strict_host_key": "yes",
       "connection_policy": {
         "mode": "broker",
@@ -82,6 +86,11 @@ cp bridge.example.json bridge.json
 
 `bridge.json` 已被 Git 忽略。它用于保存本机与远端环境配置。
 
+`rsync_bin` 和 `remote_rsync_bin` 分别指定本地与远端 Rsync executable，默认均为
+`rsync`。两项只是可选批量传输能力；未配置兼容 Rsync 时，SFTP、Exec、Web 和
+Desktop 保持可用。同步前会检查 `--protect-args` 或其现代名称
+`--secluded-args`，但实际传输参数固定使用兼容别名 `--protect-args`。
+
 macOS 和 Linux 默认使用 `broker` 模式。`direct` 模式仅用于诊断和兼容；它不会
 提供跨进程连接复用或全局熔断保护。Windows 当前默认使用 `direct`，本期尚未实现
 具备当前用户 ACL 的 named pipe，因此显式选择 `broker` 会返回
@@ -102,6 +111,10 @@ python3 remote.py --config bridge.json mkdir -p /build/output
 python3 remote.py --config bridge.json mv /build/a.txt /build/b.txt
 python3 remote.py --config bridge.json rm /build/b.txt
 python3 remote.py --config bridge.json exec --cwd / -- python3 src/main.py
+python3 remote.py --config bridge.json sync push ./dist ./assets --to /release
+python3 remote.py --config bridge.json sync pull /logs --to "$PWD/downloads"
+python3 remote.py --config bridge.json sync status JOB_ID
+python3 remote.py --config bridge.json sync cancel JOB_ID
 ```
 
 使用 `--json` 获取结构化输出：
@@ -113,6 +126,13 @@ python3 remote.py --config bridge.json --json exec --cwd / -- python3 src/main.p
 
 普通模式下，`read` 将原始字节写入 stdout。JSON 模式同时返回 UTF-8 替换文本
 与 Base64 数据。
+
+`sync push` 接受 1 至 128 个显式本地文件或目录，远端目标必须是已存在目录。
+`sync pull` 首版只接受一个远端文件或目录，本地目标必须是已存在的绝对目录。任务
+异步排队，启动命令返回 job ID；用 `status` 查询终态，用 `cancel` 取消。Broker
+内只有一个 Rsync worker 和最多 8 个等待任务，不支持 `--delete`、任意 Rsync
+参数或自动回退 SFTP。旧 Broker 不包含 `rsync` feature 时，先执行
+`python3 remote.py --config bridge.json broker stop`，再重试命令以启动新进程。
 
 要启用乐观并发控制，先从 `stat` 或 `read` 保存 `mtime` 与 `size`，
 再传给 `write`：
@@ -235,10 +255,19 @@ OpenSSH ControlMaster 可用时，Broker 持有一个 TCP、一个顺序 SFTP ch
 不支持时，SFTP 仍保持一个连接，Exec 降为单并发且每次建连受
 `min_connect_interval` 限制。
 
+Rsync 任务只在 ControlMaster 存活时启动，并通过同一 ControlPath 建立 SSH
+channel，不新增 SSH TCP。路径检查会短暂使用 SFTP，实际传输不持有 `sftp_lock` 或
+Exec semaphore。远端无兼容 Rsync 时返回 `RSYNC_UNAVAILABLE`，不会改变 Broker
+READY 状态或影响后续基础操作。
+
 ## 安全边界
 
 文件操作将配置的 `root` 视为工作区根目录，且 `root` 不可为 `/`。桥接层通过
 SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的路径。
+
+Rsync 的远端源和目标在任务排队前执行同一 SFTP `REALPATH` 根目录检查。Rsync 参数
+固定，用户路径只作为 `--` 后的 operand；远端 host 只接受 hostname、IPv4 或 SSH
+config alias。raw IPv6 应先配置 SSH alias。
 
 `exec` 不同：它在指定工作区目录启动命令，但设计上接受任意 shell 文本。命令仍可
 访问其他远端路径。完整命令沙箱需要远端账户、容器、chroot 或 `sshd` 策略；
@@ -258,6 +287,7 @@ SFTP 解析符号链接，并拒绝最终落在规范工作区根目录以外的
 - `sshbridge/sftp_client.py`：运行于 `ssh -s sftp` 的 SFTP v3 客户端。
 - `sshbridge/sftp_proto.py`：SFTP 报文编解码。
 - `sshbridge/exec_client.py`：通过 `ssh` 执行远端命令。
+- `sshbridge/rsync.py`：可选 Rsync 能力探测、参数构造和异步单 worker 任务队列。
 - `sshbridge/daemon.py`：旧 daemon 命令的 Broker 兼容入口。
 - `sshbridge/web.py`：本地 Web/API 服务、token 鉴权和 Broker 调用。
 - `sshbridge/web_assets/`：远程目录树与文本编辑界面。
@@ -285,8 +315,10 @@ python3 -m compileall -q sshbridge remote.py
 - 不读取或修改系统 SSH 配置、`~/.ssh` 与项目 `bridge.json`。
 
 本地缺少 `ssh`、`sshd` 或 `ssh-keygen` 时，集成测试自动跳过；路径与协议单元测试
-仍会运行。当前集成测试覆盖真实 SFTP 文件流程、并发冲突、符号链接逃逸、大文件限制、
-结构化命令结果、超时、CLI JSON、Broker 连接复用、熔断、并发队列和 Web API。
+仍会运行。真实 Rsync 集成测试还要求本地存在兼容 executable；缺少时只跳过该组。
+当前集成测试覆盖真实 SFTP 文件流程、并发冲突、符号链接逃逸、大文件限制、结构化
+命令结果、超时、CLI JSON、Broker 连接复用、熔断、并发队列、Rsync push/pull 和
+Web API。
 
 也可手动启动测试环境：
 
@@ -306,5 +338,6 @@ Git 中的原始测试文件。
 
 ## 状态
 
-CLI、Connection Broker、Web Explorer 与 macOS Desktop MVP 已实现。MCP Server、
-Rsync channel、Windows named pipe 和可分发的签名 Desktop 安装包仍是后续工作。
+CLI、Connection Broker、Web Explorer、macOS Desktop 与 Rsync CLI/Broker MVP
+已实现。MCP Server、Rsync Web/Desktop UI、Windows named pipe 和可分发的签名
+Desktop 安装包仍是后续工作。

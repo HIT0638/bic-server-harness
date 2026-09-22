@@ -77,6 +77,20 @@ request ID、实例 ID、单例锁和可用时的 peer UID 校验。
 Windows named pipe 尚未实现。Windows 必须保持显式 direct 兼容路径，不得回退到
 未认证 localhost TCP Broker。
 
+## Rsync 规则
+
+- Rsync 是可选增强；本地或远端能力不足时，SFTP、Exec、Web 和 Desktop 必须保持
+  可用，不得安装远端依赖或自动回退 SFTP。
+- 同步只通过 Broker 启动，并要求当前 ControlMaster 存活。传输必须复用其
+  ControlPath，不得新建 SSH TCP。
+- 远端源和目标必须先经 SFTP `REALPATH` 与 canonical root 检查；传输期间不得持有
+  `sftp_lock`、`exec_semaphore` 或 `connect_lock`。
+- Rsync 参数必须固定并包含 protected args、`--links` 和 `--safe-links`。能力探测
+  接受帮助文本中的 `--protect-args` 或现代名称 `--secluded-args`；调用方不得注入
+  options，也不得提供 `--delete`。
+- 任务保持单并发和有界队列、输出、历史。取消本地进程组后必须保留
+  `remote_termination_unknown=true`，不得宣称远端已确认终止。
+
 ## 兼容性
 
 - 除非依赖能显著降低协议或安全风险，否则只使用 Python 标准库。

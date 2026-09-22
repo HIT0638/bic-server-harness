@@ -259,7 +259,8 @@ command -v <remote_rsync_bin>
 要求：
 
 - 本地和远端 executable 均存在。
-- 本地和远端帮助文本均包含 `--protect-args`。
+- 本地和远端帮助文本包含 `--protect-args`，或 Rsync 3.2.6 起采用的现代名称
+  `--secluded-args`；实际传输仍固定传兼容别名 `--protect-args`。
 - 当前 transport 必须 `multiplexing=true` 且 ControlMaster alive。
 - 不能只比较版本字符串；兼容实现可能报告不同版本格式。
 
@@ -454,7 +455,7 @@ Rsync argv，不解析远端真实路径。
 新增并文档化：
 
 ```text
-RSYNC_UNAVAILABLE         本地或远端无兼容 executable/--protect-args
+RSYNC_UNAVAILABLE         本地或远端无兼容 executable/protected args
 RSYNC_MULTIPLEX_REQUIRED 当前 profile 无可用 ControlMaster
 RSYNC_UNSAFE_CONFIG      host 或 remote_rsync_bin 无法安全表达
 RSYNC_FAILED             Rsync 以非零状态结束
@@ -486,7 +487,7 @@ ControlPath、真实 remote root 或本地源路径。
 以 `RsyncManager` interface 为主要测试面，使用临时目录和假的 process adapter：
 
 - 本地/远端 capability 成功与缺失。
-- 仅版本号足够但没有 `--protect-args` 时拒绝。
+- 仅版本号足够但没有 `--protect-args` 或 `--secluded-args` 时拒绝。
 - `remote_rsync_bin` 和 host 的非法字符拒绝。
 - argv 固定参数、`--` 位置、ControlPath、port、user、ProxyJump 继承。
 - 本地/远端路径不进入 `-e` remote-shell 字符串。
@@ -528,7 +529,7 @@ ControlPath、真实 remote root 或本地源路径。
 - running cancel 后任务进入 `cancelled` 且
   `remote_termination_unknown=true`。
 - fake SSH transport failure 使 Broker 进入 `OPEN`，业务请求不自动重连。
-- 远端无 Rsync/无 `--protect-args` 时 `sync_start` 失败，但随后的 `list_dir`、
+- 远端无 Rsync/无 protected args 时 `sync_start` 失败，但随后的 `list_dir`、
   `read_file` 和 Exec 仍正常。
 
 真实 Rsync 集成测试在缺少兼容本地 executable 时允许 skip，因为 Rsync 是可选能力；
@@ -663,7 +664,7 @@ git diff --check
 ```sh
 brew install rsync
 /opt/homebrew/bin/rsync --version
-/opt/homebrew/bin/rsync --help | grep -- --protect-args
+/opt/homebrew/bin/rsync --help | grep -E -- '--(protect|secluded)-args'
 ```
 
 使用 `tests/local_sshd.py` 的临时模式和临时 profile 跑真实 push/pull。验收时记录：
@@ -725,7 +726,7 @@ App 仍保持 unsigned/ad-hoc arm64 MVP；Rsync executable 不打入 bundle。
 - 传输不持有 `sftp_lock`；传输期间目录浏览正常。
 - 真实传输复用当前 ControlMaster，不增加 SSH TCP。
 - 任意远端源和目标都经过 SFTP canonical root 校验。
-- 本地/远端缺少 `--protect-args` 时拒绝 Rsync，不静默降级。
+- 本地/远端缺少 protected args 时拒绝 Rsync，不静默降级。
 - 无 Rsync profile 的全部基础 SFTP/Exec/Web/Desktop 能力不受影响。
 - 取消和超时不错误宣称远端进程已终止。
 - Python 3.9、Python 3.12、compileall、完整测试和 macOS bundle 构建通过。

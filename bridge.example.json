@@ -6,6 +6,8 @@
       "port": 22,
       "user": "remote-user",
       "root": "/home/remote-user/project",
+      "rsync_bin": "rsync",
+      "remote_rsync_bin": "rsync",
       "batch_mode": true,
       "strict_host_key": "yes",
       "connection_policy": {
